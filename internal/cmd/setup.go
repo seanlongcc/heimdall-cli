@@ -130,14 +130,16 @@ Cloud environments (AWS, Azure, GCP) are auto-detected for security group hints.
 
 // Run executes the 7-step setup.
 func (r *SetupRunner) Run() error {
-	isLocalDB := isLocalHost(r.DBHost)
-
 	if r.DryRun {
-		return r.printDryRun(isLocalDB)
+		return r.printDryRun(isLocalHost(r.DBHost))
 	}
 
-	// Pre-flight summary
-	r.printSummary(isLocalDB)
+	if !r.Reconfigure {
+		_, code, err := r.Exec.Run("systemctl", "show-environment")
+		if err != nil || code != 0 {
+			return fmt.Errorf("setup requires a running systemd service manager")
+		}
+	}
 
 	// Step 1: Configuration
 	fmt.Fprintln(r.Out, "=== Step 1/7: Configuration ===")
@@ -145,6 +147,9 @@ func (r *SetupRunner) Run() error {
 		return WrapError(err, "configuration failed",
 			"Check file permissions: ls -la "+r.Env.GetEnvFilePath())
 	}
+
+	isLocalDB := isLocalHost(r.DBHost)
+	r.printSummary(isLocalDB)
 
 	if r.Reconfigure {
 		fmt.Fprintln(r.Out)
@@ -877,52 +882,88 @@ func (r *SetupRunner) resolveExternalHost() (host, url string) {
 	return host, url
 }
 
+func (r *SetupRunner) runTLSCommand(name string, args ...string) error {
+	_, code, err := r.Exec.Run(name, args...)
+	if err != nil {
+		return fmt.Errorf("running %s for TLS setup: %w", name, err)
+	}
+	if code != 0 {
+		return fmt.Errorf("%s for TLS setup exited with code %d", name, code)
+	}
+	return nil
+}
+
 // configureCaddyfile applies the TLS strategy to the Caddyfile and generates
-// certificates when needed. Returns an error only on unsafe hostnames.
-func (r *SetupRunner) configureCaddyfile(strategy tlsStrategy, host, caddyfileDst string) {
+// certificates when needed.
+func (r *SetupRunner) configureCaddyfile(strategy tlsStrategy, host, caddyfileDst string) error {
+	if strategy != tlsIP {
+		if err := r.runTLSCommand("sed", "-i", fmt.Sprintf("s|^:443 {|%s {|", host), caddyfileDst); err != nil {
+			return err
+		}
+	}
 	switch strategy {
 	case tlsBYO:
-		r.Exec.Run("sed", "-i", fmt.Sprintf("s|^:443 {|%s {|", host), caddyfileDst)
-		r.Exec.Run("sed", "-i", fmt.Sprintf(`/reverse_proxy/i\\ttls %s %s`, r.TLSCert, r.TLSKey), caddyfileDst)
+		if err := r.runTLSCommand("sed", "-i", fmt.Sprintf(`/reverse_proxy/i\\ttls %s %s`, r.TLSCert, r.TLSKey), caddyfileDst); err != nil {
+			return err
+		}
 		fmt.Fprintf(r.Out, "  Caddy: configured with provided certificate\n")
 		fmt.Fprintf(r.Out, "    Cert: %s\n", r.TLSCert)
 		fmt.Fprintf(r.Out, "    Key:  %s\n", r.TLSKey)
 
 	case tlsPrivate:
-		r.Exec.Run("sed", "-i", `/reverse_proxy/i\\ttls internal`, caddyfileDst)
+		if err := r.runTLSCommand("sed", "-i", `/reverse_proxy/i\\ttls internal`, caddyfileDst); err != nil {
+			return err
+		}
 		fmt.Fprintln(r.Out, "  Caddy: private hostname detected — using internal CA")
 		fmt.Fprintln(r.Out, "    Import root CA into browsers to avoid warnings:")
 		fmt.Fprintln(r.Out, "    /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt")
 
 	case tlsPublic:
-		r.Exec.Run("sed", "-i", fmt.Sprintf("s|^:443 {|%s {|", host), caddyfileDst)
 		fmt.Fprintln(r.Out, "  Caddy: public hostname — automatic Let's Encrypt certificate")
 
 	case tlsIP:
 		certDir := r.Paths.CertDir
-		r.FS.MkdirAll(certDir, 0750)
-		r.Exec.Run("chown", "root:caddy", certDir)
+		if err := r.FS.MkdirAll(certDir, 0750); err != nil {
+			return fmt.Errorf("creating TLS certificate directory: %w", err)
+		}
+		if err := r.runTLSCommand("chown", "root:caddy", certDir); err != nil {
+			return err
+		}
 		certFile := certDir + "/server.crt"
 		keyFile := certDir + "/server.key"
 		if !r.FS.Exists(certFile) {
-			r.Exec.Run("openssl", "req", "-x509", "-nodes", "-days", "365",
+			if err := r.runTLSCommand("openssl", "req", "-x509", "-nodes", "-days", "365",
 				"-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
 				"-keyout", keyFile, "-out", certFile,
 				"-subj", fmt.Sprintf("/CN=%s", host),
-				"-addext", fmt.Sprintf("subjectAltName=IP:%s,DNS:localhost", host))
-			r.Exec.Run("chmod", "640", keyFile)
-			r.Exec.Run("chown", "root:caddy", keyFile)
-			r.Exec.Run("chmod", "644", certFile)
+				"-addext", fmt.Sprintf("subjectAltName=IP:%s,DNS:localhost", host)); err != nil {
+				return err
+			}
+			if err := r.runTLSCommand("chmod", "640", keyFile); err != nil {
+				return err
+			}
+			if err := r.runTLSCommand("chown", "root:caddy", keyFile); err != nil {
+				return err
+			}
+			if err := r.runTLSCommand("chmod", "644", certFile); err != nil {
+				return err
+			}
 			fmt.Fprintf(r.Out, "  Generated self-signed cert for %s\n", host)
 		}
-		r.Exec.Run("sed", "-i", fmt.Sprintf(`/reverse_proxy/i\\ttls %s %s`, certFile, keyFile), caddyfileDst)
+		if err := r.runTLSCommand("sed", "-i", fmt.Sprintf(`/reverse_proxy/i\\ttls %s %s`, certFile, keyFile), caddyfileDst); err != nil {
+			return err
+		}
 		fmt.Fprintln(r.Out, "  Caddy: configured with self-signed cert (IP-based deployment)")
 	}
+	return nil
 }
 
 func (r *SetupRunner) stepTLS() error {
 	// Check if Caddy is available
-	_, exitCode, _ := r.Exec.Run("command", "-v", "caddy")
+	_, exitCode, err := r.Exec.Run("sh", "-c", `command -v "$1"`, "sh", "caddy")
+	if err != nil {
+		return fmt.Errorf("looking up Caddy: %w", err)
+	}
 	if exitCode != 0 {
 		fmt.Fprintln(r.Out, "  Caddy not installed -- skipping TLS proxy setup")
 		fmt.Fprintln(r.Out, "  Install Caddy, then re-run: sudo heimdall-cli setup --skip-db")
@@ -939,7 +980,9 @@ func (r *SetupRunner) stepTLS() error {
 		fmt.Fprintln(r.Out, "  Caddyfile template not found, skipping")
 		return nil
 	}
-	r.Exec.Run("mkdir", "-p", "/etc/caddy/Caddyfile.d")
+	if err := r.runTLSCommand("mkdir", "-p", "/etc/caddy/Caddyfile.d"); err != nil {
+		return err
+	}
 	if err := r.FS.CopyFile(caddyfileSrc, caddyfileDst); err != nil {
 		return fmt.Errorf("copying Caddyfile: %w", err)
 	}
@@ -959,14 +1002,21 @@ func (r *SetupRunner) stepTLS() error {
 	}
 
 	strategy := determineTLSStrategy(externalHost, r.TLSCert, r.TLSKey)
-	r.configureCaddyfile(strategy, externalHost, caddyfileDst)
+	if err := r.configureCaddyfile(strategy, externalHost, caddyfileDst); err != nil {
+		return err
+	}
 
 	// Ensure main Caddyfile imports our config
 	caddyMain := "/etc/caddy/Caddyfile"
 	if r.FS.Exists(caddyMain) {
 		mainData, err := r.FS.ReadFile(caddyMain)
-		if err == nil && !strings.Contains(string(mainData), "import /etc/caddy/Caddyfile.d/") {
-			r.Exec.Run("sh", "-c", `echo 'import /etc/caddy/Caddyfile.d/*.caddy' >> /etc/caddy/Caddyfile`)
+		if err != nil {
+			return fmt.Errorf("reading Caddyfile: %w", err)
+		}
+		if !strings.Contains(string(mainData), "import /etc/caddy/Caddyfile.d/") {
+			if err := r.runTLSCommand("sh", "-c", `echo 'import /etc/caddy/Caddyfile.d/*.caddy' >> /etc/caddy/Caddyfile`); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -975,13 +1025,23 @@ func (r *SetupRunner) stepTLS() error {
 	// interactive password input on some systems.
 	r.Exec.Run("update-ca-trust")
 
-	// Enable and start Caddy (use systemctl directly to avoid blocking)
-	r.Systemd.EnableNow("caddy")
-	r.Exec.Run("systemctl", "restart", "caddy")
+	if err := r.Systemd.Enable("caddy"); err != nil {
+		return fmt.Errorf("enabling Caddy: %w", err)
+	}
+	if err := r.Systemd.Restart("caddy"); err != nil {
+		return fmt.Errorf("restarting Caddy: %w", err)
+	}
+	active, err := r.Systemd.IsActive("caddy")
+	if err != nil {
+		return fmt.Errorf("checking Caddy: %w", err)
+	}
+	if !active {
+		return fmt.Errorf("service caddy is not active after restart")
+	}
 	fmt.Fprintln(r.Out, "  Caddy: enabled and running")
 
 	// SELinux: allow Caddy to proxy to backend
-	_, exitCode, _ = r.Exec.Run("command", "-v", "setsebool")
+	_, exitCode, _ = r.Exec.Run("sh", "-c", `command -v "$1"`, "sh", "setsebool")
 	if exitCode == 0 {
 		r.Exec.Run("setsebool", "-P", "httpd_can_network_connect", "on")
 		fmt.Fprintln(r.Out, "  SELinux: httpd_can_network_connect enabled")
@@ -1052,7 +1112,7 @@ func (r *SetupRunner) stepSecurityPolicies() {
 	port := envDefault(env, "PORT", DefaultAppPort)
 
 	// SELinux: register port type (try -a first, fall back to -m)
-	_, exitCode, _ := r.Exec.Run("command", "-v", "semanage")
+	_, exitCode, _ := r.Exec.Run("sh", "-c", `command -v "$1"`, "sh", "semanage")
 	if exitCode == 0 {
 		_, rc, _ := r.Exec.Run("semanage", "port", "-a", "-t", "heimdall_server_port_t", "-p", "tcp", port)
 		if rc != 0 {
@@ -1060,7 +1120,7 @@ func (r *SetupRunner) stepSecurityPolicies() {
 		}
 		fmt.Fprintf(r.Out, "  SELinux: port %s registered\n", port)
 	}
-	_, exitCode, _ = r.Exec.Run("command", "-v", "restorecon")
+	_, exitCode, _ = r.Exec.Run("sh", "-c", `command -v "$1"`, "sh", "restorecon")
 	if exitCode == 0 {
 		r.Exec.Run("restorecon", "-R", r.Paths.AppDir, r.Paths.ConfigDir, r.Paths.DataDir)
 		fmt.Fprintln(r.Out, "  SELinux: file contexts applied")
@@ -1110,8 +1170,18 @@ func (r *SetupRunner) stepStartService() error {
 		return fmt.Errorf("DATABASE_PASSWORD is not set in %s — run setup first", r.Env.GetEnvFilePath())
 	}
 
-	if err := r.Systemd.EnableNow(ServiceName); err != nil {
+	if err := r.Systemd.Enable(ServiceName); err != nil {
 		return fmt.Errorf("enabling service: %w", err)
+	}
+	if err := r.Systemd.Restart(ServiceName); err != nil {
+		return fmt.Errorf("restarting service: %w", err)
+	}
+	active, err := r.Systemd.IsActive(ServiceName)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return fmt.Errorf("service %s is not active after restart", ServiceName)
 	}
 	fmt.Fprintln(r.Out, "  Service enabled and started")
 	return nil

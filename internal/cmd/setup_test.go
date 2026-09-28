@@ -508,7 +508,7 @@ func TestStepStartService_Success(t *testing.T) {
 	err := r.stepStartService()
 	require.NoError(t, err)
 	assert.Contains(t, out.String(), "Service enabled and started")
-	assert.Contains(t, r.Systemd.(*FakeSystemdRunner).Actions, "enable-now:"+ServiceName)
+	assert.Equal(t, []string{"enable:" + ServiceName, "restart:" + ServiceName}, r.Systemd.(*FakeSystemdRunner).Actions)
 }
 
 func TestStepStartService_MissingPassword(t *testing.T) {
@@ -1316,4 +1316,88 @@ func TestSetupCmd_DryRun_ShowsSkippedSteps(t *testing.T) {
 	output := out.String()
 	assert.Contains(t, output, "DRY RUN")
 	assert.Contains(t, output, "skipped")
+}
+
+func TestSetupRestartsAnExistingService(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env["DATABASE_PASSWORD"] = "existing"
+	systemd := r.Systemd.(*FakeSystemdRunner)
+	systemd.ActiveServices[ServiceName] = true
+	require.NoError(t, r.stepStartService())
+	require.Equal(t, []string{"enable:" + ServiceName, "restart:" + ServiceName}, systemd.Actions)
+}
+
+func TestSetupUsesExistingRemoteHost(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.DBHost = "localhost"
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"DATABASE_HOST": "db.example.test", "DATABASE_PASSWORD": "existing",
+	}
+	r.SkipTLS = true
+	require.NoError(t, r.Run())
+	require.Contains(t, out.String(), "skipped -- external database")
+	require.Contains(t, out.String(), "Database host: db.example.test:")
+	for _, call := range r.Exec.(*FakeExecRunner).Calls {
+		require.NotEqual(t, "runuser", call.Name)
+	}
+}
+
+func TestSetupRejectsMissingServiceManager(t *testing.T) {
+	for _, result := range []FakeExecResult{{ExitCode: 1}, {Err: errors.New("systemctl missing")}} {
+		r, out, _ := newTestSetupRunner()
+		r.Exec.(*FakeExecRunner).Results["systemctl show-environment"] = result
+		require.ErrorContains(t, r.Run(), "running systemd service manager")
+		require.Empty(t, r.Env.(*FakeEnvManager).Env)
+		require.Empty(t, out.String())
+		require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
+		r.Reconfigure = true
+		require.NoError(t, r.Run())
+		require.NotEmpty(t, r.Env.(*FakeEnvManager).Env)
+	}
+}
+
+func TestSetupRequiredServiceFailures(t *testing.T) {
+	for _, service := range []string{ServiceName, "caddy"} {
+		for _, failure := range []string{"enable", "restart", "is-active", "inactive"} {
+			t.Run(service+"/"+failure, func(t *testing.T) {
+				dir := t.TempDir()
+				calls := filepath.Join(dir, "calls")
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "systemctl"), []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$SYSTEMCTL_CALLS"
+if [ "$1" = "$SYSTEMCTL_FAILURE" ]; then exit 1; fi
+if [ "$1" = is-active ]; then
+  if [ "$SYSTEMCTL_FAILURE" = inactive ]; then echo inactive; else echo active; fi
+fi
+`), 0755))
+				t.Setenv("PATH", dir)
+				t.Setenv("SYSTEMCTL_CALLS", calls)
+				t.Setenv("SYSTEMCTL_FAILURE", failure)
+				r, out, _ := newTestSetupRunner()
+				r.Env.(*FakeEnvManager).Env["DATABASE_PASSWORD"] = "existing"
+				if service == "caddy" {
+					r, out = newTLSTestRunner(map[string]string{"EXTERNAL_URL": "https://heimdall.internal"})
+				}
+				r.Systemd = &systemdRunner{}
+				var err error
+				if service == "caddy" {
+					err = r.stepTLS()
+				} else {
+					err = r.stepStartService()
+				}
+				require.Error(t, err)
+				require.NotContains(t, out.String(), "enabled and running")
+				require.NotContains(t, out.String(), "Service enabled and started")
+				data, readErr := os.ReadFile(calls)
+				require.NoError(t, readErr)
+				want := "enable " + service + "\n"
+				if failure != "enable" {
+					want += "restart " + service + "\n"
+				}
+				if failure == "is-active" || failure == "inactive" {
+					want += "is-active " + service + "\n"
+				}
+				require.Equal(t, want, string(data))
+			})
+		}
+	}
 }

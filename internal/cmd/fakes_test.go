@@ -46,7 +46,7 @@ type FakeExecResult struct {
 }
 
 // execKey builds a lookup key from the command name and first two args.
-// Using two args avoids collisions like "command -v caddy" vs "command -v setsebool".
+// Run also accepts full command keys to distinguish shell lookup arguments.
 func execKey(name string, args []string) string {
 	switch {
 	case len(args) >= 2:
@@ -60,6 +60,12 @@ func execKey(name string, args []string) string {
 
 func (f *FakeExecRunner) Run(name string, args ...string) (string, int, error) {
 	f.Calls = append(f.Calls, FakeExecCall{Name: name, Args: args})
+	fullKey := strings.Join(append([]string{name}, args...), " ")
+	if r, ok := f.Results[fullKey]; ok {
+		r.matched = true
+		f.Results[fullKey] = r
+		return r.Stdout, r.ExitCode, r.Err
+	}
 	key := execKey(name, args)
 	if r, ok := f.Results[key]; ok {
 		r.matched = true
@@ -144,14 +150,29 @@ func (f *FakeSystemdRunner) IsActive(service string) (bool, error) {
 }
 func (f *FakeSystemdRunner) Start(service string) error {
 	f.Actions = append(f.Actions, "start:"+service)
+	if f.Err == nil {
+		if f.ActiveServices == nil {
+			f.ActiveServices = make(map[string]bool)
+		}
+		f.ActiveServices[service] = true
+	}
 	return f.Err
 }
 func (f *FakeSystemdRunner) Stop(service string) error {
 	f.Actions = append(f.Actions, "stop:"+service)
+	if f.Err == nil {
+		delete(f.ActiveServices, service)
+	}
 	return f.Err
 }
 func (f *FakeSystemdRunner) Restart(service string) error {
 	f.Actions = append(f.Actions, "restart:"+service)
+	if f.Err == nil {
+		if f.ActiveServices == nil {
+			f.ActiveServices = make(map[string]bool)
+		}
+		f.ActiveServices[service] = true
+	}
 	return f.Err
 }
 func (f *FakeSystemdRunner) Enable(service string) error {
@@ -160,6 +181,12 @@ func (f *FakeSystemdRunner) Enable(service string) error {
 }
 func (f *FakeSystemdRunner) EnableNow(service string) error {
 	f.Actions = append(f.Actions, "enable-now:"+service)
+	if f.Err == nil {
+		if f.ActiveServices == nil {
+			f.ActiveServices = make(map[string]bool)
+		}
+		f.ActiveServices[service] = true
+	}
 	return f.Err
 }
 func (f *FakeSystemdRunner) Reload(service string) error {
@@ -245,12 +272,12 @@ type fakeFileInfo struct {
 	size int64
 }
 
-func (fi *fakeFileInfo) Name() string      { return fi.name }
-func (fi *fakeFileInfo) Size() int64       { return fi.size }
-func (fi *fakeFileInfo) Mode() os.FileMode { return 0640 }
+func (fi *fakeFileInfo) Name() string       { return fi.name }
+func (fi *fakeFileInfo) Size() int64        { return fi.size }
+func (fi *fakeFileInfo) Mode() os.FileMode  { return 0640 }
 func (fi *fakeFileInfo) ModTime() time.Time { return time.Time{} }
-func (fi *fakeFileInfo) IsDir() bool       { return false }
-func (fi *fakeFileInfo) Sys() interface{}  { return nil }
+func (fi *fakeFileInfo) IsDir() bool        { return false }
+func (fi *fakeFileInfo) Sys() interface{}   { return nil }
 func (f *FakeFileSystem) CopyFile(src, dst string) error {
 	data, ok := f.Files[src]
 	if !ok {

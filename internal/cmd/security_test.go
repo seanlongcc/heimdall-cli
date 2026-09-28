@@ -28,7 +28,7 @@ func newSecurityTestRunner(env map[string]string) (*SetupRunner, *bytes.Buffer) 
 func TestStepSecurityPolicies_SELinuxPresent(t *testing.T) {
 	r, out := newSecurityTestRunner(map[string]string{"PORT": "3000"})
 	// semanage and restorecon are available
-	r.Exec.(*FakeExecRunner).Results["command -v"] = FakeExecResult{ExitCode: 0}
+	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{ExitCode: 0}
 
 	r.stepSecurityPolicies()
 
@@ -51,7 +51,7 @@ func TestStepSecurityPolicies_SELinuxPresent(t *testing.T) {
 func TestStepSecurityPolicies_SELinuxAbsent(t *testing.T) {
 	r, out := newSecurityTestRunner(map[string]string{"PORT": "3000"})
 	// semanage not available
-	r.Exec.(*FakeExecRunner).Results["command -v"] = FakeExecResult{ExitCode: 1}
+	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{ExitCode: 1}
 
 	r.stepSecurityPolicies()
 
@@ -62,7 +62,7 @@ func TestStepSecurityPolicies_SELinuxAbsent(t *testing.T) {
 
 func TestStepSecurityPolicies_CustomPort(t *testing.T) {
 	r, out := newSecurityTestRunner(map[string]string{"PORT": "8443"})
-	r.Exec.(*FakeExecRunner).Results["command -v"] = FakeExecResult{ExitCode: 0}
+	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{ExitCode: 0}
 	r.SkipTLS = true
 	r.Systemd.(*FakeSystemdRunner).ActiveServices["firewalld"] = true
 
@@ -92,7 +92,7 @@ func TestStepSecurityPolicies_CustomPort(t *testing.T) {
 func TestStepSecurityPolicies_DefaultPort(t *testing.T) {
 	// No PORT in env — should default to 3000
 	r, out := newSecurityTestRunner(map[string]string{})
-	r.Exec.(*FakeExecRunner).Results["command -v"] = FakeExecResult{ExitCode: 0}
+	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{ExitCode: 0}
 
 	r.stepSecurityPolicies()
 

@@ -126,7 +126,7 @@ func (r *PostgresBootstrapRunner) detectPG() (*pgInstall, error) {
 
 	// 2. Fall back to system psql via PATH lookup.
 	if install.PsqlBin == "" {
-		stdout, code, err := r.Exec.Run("command", "-v", "psql")
+		stdout, code, err := r.Exec.Run("sh", "-c", `command -v "$1"`, "sh", "psql")
 		if err != nil || code != 0 || strings.TrimSpace(stdout) == "" {
 			return nil, fmt.Errorf(
 				"psql not found; install a PostgreSQL client/server (>= %d) before running setup",
@@ -136,7 +136,7 @@ func (r *PostgresBootstrapRunner) detectPG() (*pgInstall, error) {
 		install.Service = "postgresql"
 		install.DataDir = "/var/lib/pgsql/data"
 		// Best-effort: locate the system postgresql-setup binary.
-		if setupOut, setupCode, _ := r.Exec.Run("command", "-v", "postgresql-setup"); setupCode == 0 {
+		if setupOut, setupCode, _ := r.Exec.Run("sh", "-c", `command -v "$1"`, "sh", "postgresql-setup"); setupCode == 0 {
 			install.SetupBin = strings.TrimSpace(setupOut)
 		}
 	}

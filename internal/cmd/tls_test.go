@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -88,7 +90,7 @@ func newTLSTestRunner(env map[string]string) (*SetupRunner, *bytes.Buffer) {
 		Exec: &FakeExecRunner{
 			Results: map[string]FakeExecResult{
 				// caddy is installed
-				"command -v": {ExitCode: 0},
+				`sh -c command -v "$1"`: {ExitCode: 0},
 			},
 		},
 		Systemd: &FakeSystemdRunner{
@@ -105,7 +107,7 @@ func newTLSTestRunner(env map[string]string) (*SetupRunner, *bytes.Buffer) {
 
 func TestStepTLS_CaddyNotInstalled(t *testing.T) {
 	r, out := newTLSTestRunner(map[string]string{})
-	r.Exec.(*FakeExecRunner).Results["command -v"] = FakeExecResult{ExitCode: 1}
+	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{ExitCode: 1}
 
 	err := r.stepTLS()
 
@@ -334,15 +336,7 @@ func TestStepTLS_CaddyServiceEnabled(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out.String(), "Caddy: enabled and running")
 
-	// Verify systemd enable-now
-	actions := r.Systemd.(*FakeSystemdRunner).Actions
-	foundEnable := false
-	for _, a := range actions {
-		if a == "enable-now:caddy" {
-			foundEnable = true
-		}
-	}
-	assert.True(t, foundEnable, "caddy service should be enabled")
+	assert.Equal(t, []string{"enable:caddy", "restart:caddy"}, r.Systemd.(*FakeSystemdRunner).Actions)
 }
 
 func TestStepTLS_SELinuxBooleanSet(t *testing.T) {
@@ -364,4 +358,72 @@ func TestStepTLS_SELinuxBooleanSet(t *testing.T) {
 		}
 	}
 	assert.True(t, foundSetsebool, "setsebool should enable httpd_can_network_connect")
+}
+
+func TestStepTLS_PrivateHostnameSiteAddress(t *testing.T) {
+	r, _ := newTLSTestRunner(map[string]string{"EXTERNAL_URL": "https://heimdall.internal"})
+	require.NoError(t, r.stepTLS())
+	require.Contains(t, r.Exec.(*FakeExecRunner).Calls, FakeExecCall{
+		Name: "sed", Args: []string{"-i", "s|^:443 {|heimdall.internal {|", "/etc/caddy/Caddyfile.d/heimdall-server.caddy"},
+	})
+}
+
+func TestStepTLS_RequiredCommandFailure(t *testing.T) {
+	for _, command := range []string{
+		"mkdir -p", "sed -i", "sh -c echo 'import /etc/caddy/Caddyfile.d/*.caddy' >> /etc/caddy/Caddyfile",
+		"openssl req", "chown root:caddy", "chmod 640", "chmod 644",
+	} {
+		for _, result := range []FakeExecResult{{ExitCode: 1}, {Err: errors.New("cannot execute")}} {
+			t.Run(command, func(t *testing.T) {
+				r, out := newTLSTestRunner(map[string]string{"EXTERNAL_URL": "https://192.168.1.100"})
+				r.Exec.(*FakeExecRunner).Results[command] = result
+				require.Error(t, r.stepTLS())
+				require.NotContains(t, out.String(), "Caddy: enabled and running")
+				require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
+			})
+		}
+	}
+}
+
+func TestStepTLS_LookupExecutionFailure(t *testing.T) {
+	r, out := newTLSTestRunner(map[string]string{})
+	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{Err: errors.New("cannot execute")}
+	require.ErrorContains(t, r.stepTLS(), "cannot execute")
+	require.NotContains(t, out.String(), "Caddy: enabled and running")
+}
+
+type tlsFailFS struct {
+	FileSystem
+	operation string
+}
+
+func (f tlsFailFS) CopyFile(src, dst string) error {
+	if f.operation == "copy" {
+		return errors.New("copy denied")
+	}
+	return f.FileSystem.CopyFile(src, dst)
+}
+func (f tlsFailFS) ReadFile(path string) ([]byte, error) {
+	if f.operation == "read" {
+		return nil, errors.New("read denied")
+	}
+	return f.FileSystem.ReadFile(path)
+}
+func (f tlsFailFS) MkdirAll(path string, perm os.FileMode) error {
+	if f.operation == "mkdir" {
+		return errors.New("mkdir denied")
+	}
+	return f.FileSystem.MkdirAll(path, perm)
+}
+
+func TestStepTLS_RequiredFileFailure(t *testing.T) {
+	for _, operation := range []string{"copy", "read", "mkdir"} {
+		t.Run(operation, func(t *testing.T) {
+			r, out := newTLSTestRunner(map[string]string{"EXTERNAL_URL": "https://192.168.1.100"})
+			r.FS = tlsFailFS{FileSystem: r.FS, operation: operation}
+			require.ErrorContains(t, r.stepTLS(), operation+" denied")
+			require.NotContains(t, out.String(), "Caddy: enabled and running")
+			require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
+		})
+	}
 }

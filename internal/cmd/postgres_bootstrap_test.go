@@ -3,6 +3,8 @@ package cmd
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -160,7 +162,7 @@ func TestPostgresBootstrap_DetectPG_PrefersHigherPGDGVersion(t *testing.T) {
 func TestPostgresBootstrap_DetectPG_FallsBackToSystemPsql(t *testing.T) {
 	r, exec, _, _, _ := newBootstrapForTest()
 	// No PGDG paths exist. command -v psql returns the system path.
-	exec.Results["command -v psql"] = FakeExecResult{Stdout: "/usr/bin/psql\n"}
+	exec.Results[`sh -c command -v "$1" sh psql`] = FakeExecResult{Stdout: "/usr/bin/psql\n"}
 	exec.Results["/usr/bin/psql --version"] = FakeExecResult{
 		Stdout: "psql (PostgreSQL) 15.5\n"}
 
@@ -176,7 +178,7 @@ func TestPostgresBootstrap_DetectPG_FallsBackToSystemPsql(t *testing.T) {
 func TestPostgresBootstrap_DetectPG_ErrorsWhenNoPsqlFound(t *testing.T) {
 	r, exec, _, _, _ := newBootstrapForTest()
 	// Empty fakes — neither PGDG paths nor command -v finds anything.
-	exec.Results["command -v psql"] = FakeExecResult{ExitCode: 1}
+	exec.Results[`sh -c command -v "$1" sh psql`] = FakeExecResult{ExitCode: 1}
 
 	install, err := r.detectPG()
 
@@ -190,7 +192,7 @@ func TestPostgresBootstrap_DetectPG_RejectsVersionBelow13(t *testing.T) {
 	fs.Files["/usr/pgsql-12/bin/psql"] = []byte("")
 	// Should NOT pick up pgsql-12 (out of probe range), so falls through.
 	// But if some user had set system psql to 12, we'd reject it:
-	exec.Results["command -v psql"] = FakeExecResult{Stdout: "/usr/bin/psql\n"}
+	exec.Results[`sh -c command -v "$1" sh psql`] = FakeExecResult{Stdout: "/usr/bin/psql\n"}
 	exec.Results["/usr/bin/psql --version"] = FakeExecResult{
 		Stdout: "psql (PostgreSQL) 12.20\n"}
 
@@ -571,7 +573,7 @@ func TestPostgresBootstrap_TestConnection_ErrorsOnFailure(t *testing.T) {
 	r, exec, _, _, _ := newBootstrapForTest()
 	install := &pgInstall{PsqlBin: "/usr/bin/psql"}
 	exec.Results["/usr/bin/psql postgresql://heimdall@127.0.0.1:5432/heimdall-server-production -c"] = FakeExecResult{
-		Stdout: "psql: error: connection to server at \"127.0.0.1\" failed",
+		Stdout:   "psql: error: connection to server at \"127.0.0.1\" failed",
 		ExitCode: 2,
 	}
 
@@ -633,7 +635,7 @@ func TestPostgresBootstrap_Run_FullOrchestration(t *testing.T) {
 
 func TestPostgresBootstrap_Run_PropagatesDetectFailure(t *testing.T) {
 	r, exec, _, _, _ := newBootstrapForTest()
-	exec.Results["command -v psql"] = FakeExecResult{ExitCode: 1}
+	exec.Results[`sh -c command -v "$1" sh psql`] = FakeExecResult{ExitCode: 1}
 
 	err := r.Run()
 
@@ -709,4 +711,28 @@ func TestPostgresBootstrap_DoesNotSkipForLocalhost(t *testing.T) {
 				"localhost must trigger PG detection")
 		})
 	}
+}
+
+func TestPostgresBootstrap_DetectPG_RealPathLookup(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.Symlink("/bin/sh", filepath.Join(dir, "sh")))
+	psql := filepath.Join(dir, "psql")
+	require.NoError(t, os.WriteFile(psql, []byte("#!/bin/sh\necho 'psql (PostgreSQL) 18.0'\n"), 0755))
+	setup := filepath.Join(dir, "postgresql-setup")
+	require.NoError(t, os.WriteFile(setup, []byte("#!/bin/sh\nexit 0\n"), 0755))
+	t.Setenv("PATH", dir)
+	r, _, _, _, _ := newBootstrapForTest()
+	r.Exec = &execRunner{}
+	install, err := r.detectPG()
+	require.NoError(t, err)
+	require.Equal(t, psql, install.PsqlBin)
+	require.Equal(t, setup, install.SetupBin)
+	require.Equal(t, 18, install.Major)
+	require.NoError(t, os.Remove(setup))
+	install, err = r.detectPG()
+	require.NoError(t, err)
+	require.Empty(t, install.SetupBin)
+	require.NoError(t, os.Remove(psql))
+	_, err = r.detectPG()
+	require.ErrorContains(t, err, "psql not found")
 }
