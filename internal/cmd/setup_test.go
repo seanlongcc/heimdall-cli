@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -193,6 +195,59 @@ func TestSetupCmd_ConnectionTestFailure(t *testing.T) {
 }
 
 // --- stepConfigure preservation tests ---
+
+func TestStepConfigurePreservesAdditionalSettings(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	original := map[string]string{
+		"LOCAL_LOGIN_DISABLED": "true", "OIDC_NAME": "Corporate Login",
+		"EXTERNAL_URL":      "https://heimdall.example.test",
+		"DATABASE_PASSWORD": "existing-password", "JWT_SECRET": "existing-jwt",
+		"API_KEY_SECRET": "existing-api",
+	}
+	r.Env.(*FakeEnvManager).Env = original
+	require.NoError(t, r.stepConfigure())
+	first, err := r.Env.ReadEnv()
+	require.NoError(t, err)
+	for key, value := range original {
+		require.Equal(t, value, first[key], key)
+	}
+	require.NoError(t, r.stepConfigure())
+	second, err := r.Env.ReadEnv()
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+}
+
+func TestStepConfigureReturnsReadError(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	path := t.TempDir()
+	marker := filepath.Join(path, "keep")
+	require.NoError(t, os.WriteFile(marker, []byte("unchanged"), 0640))
+	r.Env = &FileEnvManager{Path: path}
+	_, readErr := r.Env.ReadEnv()
+	require.Error(t, readErr)
+
+	err := r.stepConfigure()
+	require.EqualError(t, err, readErr.Error())
+	require.Empty(t, out.String())
+	require.Empty(t, r.Exec.(*FakeExecRunner).Calls)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.True(t, info.IsDir())
+	content, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "unchanged", string(content))
+}
+
+func TestStepConfigureCreatesMissingFile(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env = &FileEnvManager{Path: filepath.Join(t.TempDir(), "backend.env")}
+	require.NoError(t, r.stepConfigure())
+	env, err := r.Env.ReadEnv()
+	require.NoError(t, err)
+	require.NotEmpty(t, env["DATABASE_PASSWORD"])
+	require.NotEmpty(t, env["JWT_SECRET"])
+	require.NotEmpty(t, env["API_KEY_SECRET"])
+}
 
 func TestStepConfigure_PreservesExistingSecrets(t *testing.T) {
 	r, _, _ := newTestSetupRunner()
@@ -616,16 +671,16 @@ func TestInteractive_ExternalDB_BYOCert(t *testing.T) {
 			"TLS/SSL setup":  2, // BYO certificate
 		},
 		Inputs: map[string]string{
-			"Database host":      "db.example.com",
-			"Database port":      "5432",
-			"Database user":      "heimdall",
-			"Database password":  "secret",
-			"Confirm password":   "secret",
-			"Database name":      "heimdall_prod",
+			"Database host":        "db.example.com",
+			"Database port":        "5432",
+			"Database user":        "heimdall",
+			"Database password":    "secret",
+			"Confirm password":     "secret",
+			"Database name":        "heimdall_prod",
 			"TLS certificate path": "/etc/pki/tls/certs/heimdall.crt",
 			"TLS private key path": "/etc/pki/tls/private/heimdall.key",
-			"External URL":       "https://heimdall.example.com",
-			"Admin email":        "admin@example.com",
+			"External URL":         "https://heimdall.example.com",
+			"Admin email":          "admin@example.com",
 		},
 		IsTTY: true,
 	}
@@ -723,7 +778,7 @@ func TestInteractive_RerunEditConfig(t *testing.T) {
 			"Database host":     "new-host.example.com", // changed
 			"Database port":     "5432",                 // kept
 			"Database user":     "postgres",             // kept
-			"Database password": "old-pass",             // kept
+			"Database password": "",                     // blank keeps the existing password
 			"Database name":     "olddb",                // kept
 			"External URL":      "https://old.example.com",
 			"Admin email":       "old@example.com",
@@ -1154,8 +1209,8 @@ func TestInteractive_ExternalDB_ConnectivityTestFails(t *testing.T) {
 	r.DB.(*FakeDBConnector).ConnErr = fmt.Errorf("connection refused")
 	r.Prompter = &FakePrompter{
 		Selects: map[string]int{
-			"Database setup":                       1, // External
-			"TLS/SSL setup":                        3, // No TLS
+			"Database setup":                        1, // External
+			"TLS/SSL setup":                         3, // No TLS
 			"Connection failed. What would you do?": 1, // Continue anyway
 		},
 		Inputs: map[string]string{
@@ -1183,7 +1238,7 @@ func TestInteractive_ExternalDB_ConnectivityTestFails_Abort(t *testing.T) {
 	r.DB.(*FakeDBConnector).ConnErr = fmt.Errorf("connection refused")
 	r.Prompter = &FakePrompter{
 		Selects: map[string]int{
-			"Database setup":                       1, // External
+			"Database setup":                        1, // External
 			"Connection failed. What would you do?": 0, // Abort
 		},
 		Inputs: map[string]string{

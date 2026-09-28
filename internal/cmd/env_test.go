@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -29,6 +31,21 @@ func TestParseEnv(t *testing.T) {
 			name:     "single-quoted value",
 			input:    `SECRET='my-secret'`,
 			expected: map[string]string{"SECRET": "my-secret"},
+		},
+		{
+			name:     "export prefix and literal escapes",
+			input:    "export SECRET=\"quote\\\" \\$literal \\`text\\` \\\\ \\n\"",
+			expected: map[string]string{"SECRET": "quote\" $literal `text` \\ \\n"},
+		},
+		{
+			name:     "only one pair of outer quotes removed",
+			input:    "SECRET='\"keep quotes\"'",
+			expected: map[string]string{"SECRET": "\"keep quotes\""},
+		},
+		{
+			name:     "variables and commands are not evaluated",
+			input:    "SECRET=\"$HOME $(printf executed) `printf executed`\"",
+			expected: map[string]string{"SECRET": "$HOME $(printf executed) `printf executed`"},
 		},
 		{
 			name:     "comments and blank lines",
@@ -101,7 +118,7 @@ func TestFileEnvManager_WriteEnvKey(t *testing.T) {
 		data, err := os.ReadFile(path)
 		require.NoError(t, err)
 		assert.Contains(t, string(data), "# Database config")
-		assert.Contains(t, string(data), "PORT=8080")
+		assert.Contains(t, string(data), "PORT=\"8080\"")
 		assert.Contains(t, string(data), "# End")
 	})
 }
@@ -176,10 +193,10 @@ func TestFileEnvManager_WriteEnvFile(t *testing.T) {
 		content := string(data)
 
 		// Keys should be in sorted order
-		assert.Equal(t, "AAA_FIRST=first\nMMM_MID=middle\nZZZ_LAST=last\n", content)
+		assert.Equal(t, "AAA_FIRST=\"first\"\nMMM_MID=\"middle\"\nZZZ_LAST=\"last\"\n", content)
 	})
 
-	t.Run("replaces existing file content", func(t *testing.T) {
+	t.Run("preserves existing file content", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "test.env")
 		require.NoError(t, os.WriteFile(path, []byte("OLD_KEY=old_value\n"), 0640))
@@ -192,8 +209,7 @@ func TestFileEnvManager_WriteEnvFile(t *testing.T) {
 		data, err := os.ReadFile(path)
 		require.NoError(t, err)
 		content := string(data)
-		assert.NotContains(t, content, "OLD_KEY")
-		assert.Contains(t, content, "NEW_KEY=new_value")
+		assert.Equal(t, "OLD_KEY=old_value\nNEW_KEY=\"new_value\"\n", content)
 	})
 
 	t.Run("round-trips through ReadEnv", func(t *testing.T) {
@@ -236,4 +252,116 @@ func TestFileEnvManager_WriteEnvFile(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, os.FileMode(0640), info.Mode().Perm())
 	})
+}
+
+func TestWriteEnvPreservesTextAndLiteralSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backend.env")
+	initial := "# operator comment\nLOCAL_LOGIN_DISABLED=true\nOIDC_NAME='Corporate Login'\n"
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0640))
+	manager := &FileEnvManager{Path: path}
+	secret := "Rpm $literal `text` \\" + " quote\""
+	require.NoError(t, manager.WriteEnvFile(map[string]string{"DATABASE_PASSWORD": secret}))
+	first, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(string(first), initial))
+	values, err := manager.ReadEnv()
+	require.NoError(t, err)
+	require.Equal(t, secret, values["DATABASE_PASSWORD"])
+	command := exec.Command("bash", "-c", `set -e; source "$1"; printf '%s' "$DATABASE_PASSWORD"`, "test", path)
+	output, err := command.Output()
+	require.NoError(t, err)
+	require.Equal(t, secret, string(output))
+	require.NoError(t, manager.WriteEnvFile(values))
+	second, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+}
+
+func TestWriteEnvRejectsInvalidEntriesWithoutChangingFile(t *testing.T) {
+	for _, entry := range []struct{ key, value string }{
+		{"", "value"}, {"1KEY", "value"}, {"KEY;false", "value"},
+		{"KEY$(false)", "value"}, {"KEY`false`", "value"}, {"KEY-NAME", "value"},
+		{"KEY.NAME", "value"}, {"KEY NAME", "value"}, {"KEY=NAME", "value"},
+		{"KEY\tNAME", "value"}, {"KEY\nNAME", "value"}, {"KEY\rNAME", "value"},
+		{"KEY\x00NAME", "value"}, {"KÉY", "value"},
+		{"KEY", "line\nbreak"}, {"KEY", "carriage\rreturn"}, {"KEY", "nul\x00byte"},
+	} {
+		t.Run(entry.key+"/"+entry.value, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "backend.env")
+			initial := "# keep\nKEY=original\n"
+			require.NoError(t, os.WriteFile(path, []byte(initial), 0640))
+			manager := &FileEnvManager{Path: path}
+			require.Error(t, manager.WriteEnvFile(map[string]string{"VALID": "changed", entry.key: entry.value}))
+			content, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, initial, string(content))
+			require.Error(t, manager.WriteEnvKey(entry.key, entry.value))
+			content, err = os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, initial, string(content))
+		})
+	}
+}
+
+func TestWriteEnvKeyPreservesLiteralAndUnchangedText(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backend.env")
+	initial := "# keep\nexport SECRET='old'\n\n  UNCHANGED='same value'\n"
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0600))
+	manager := &FileEnvManager{Path: path}
+	secret := "quotes '\" $literal `text` \\"
+	require.NoError(t, manager.WriteEnvKey("SECRET", secret))
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.True(t, strings.HasSuffix(string(content), "\n\n  UNCHANGED='same value'\n"))
+	require.True(t, strings.HasPrefix(string(content), "# keep\n"))
+	values, err := manager.ReadEnv()
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"SECRET": secret, "UNCHANGED": "same value"}, values)
+	command := exec.Command("bash", "-c", `set -e; source "$1"; printf '%s' "$SECRET"`, "test", path)
+	output, err := command.Output()
+	require.NoError(t, err)
+	require.Equal(t, secret, string(output))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
+}
+
+func TestWriteEnvFilePreservesEmptyUpdatesAndLineEndings(t *testing.T) {
+	for _, initial := range []string{"", "KEY='value'", "# keep\nKEY='value'\n\n"} {
+		t.Run(initial, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "backend.env")
+			require.NoError(t, os.WriteFile(path, []byte(initial), 0640))
+			manager := &FileEnvManager{Path: path}
+			for _, entries := range []map[string]string{{}, ParseEnv(initial)} {
+				require.NoError(t, manager.WriteEnvFile(entries))
+				content, err := os.ReadFile(path)
+				require.NoError(t, err)
+				require.Equal(t, initial, string(content))
+			}
+		})
+	}
+}
+
+func TestWriteEnvFileUpdatesDuplicatesAndSortsNewKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backend.env")
+	require.NoError(t, os.WriteFile(path, []byte("# keep\nKEY=old\nexport KEY='last'\n"), 0640))
+	manager := &FileEnvManager{Path: path}
+	require.NoError(t, manager.WriteEnvFile(map[string]string{
+		"KEY": "updated", "_a0": "underscore", "aZ09": "letters and digits",
+	}))
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "# keep\nKEY=\"updated\"\nKEY=\"updated\"\n_a0=\"underscore\"\naZ09=\"letters and digits\"\n", string(content))
+}
+
+func TestWriteEnvReturnsReadErrors(t *testing.T) {
+	path := t.TempDir()
+	manager := &FileEnvManager{Path: path}
+	_, readErr := manager.ReadEnv()
+	require.Error(t, readErr)
+	require.EqualError(t, manager.WriteEnvFile(map[string]string{"KEY": "value"}), readErr.Error())
+	require.EqualError(t, manager.WriteEnvKey("KEY", "value"), readErr.Error())
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.True(t, info.IsDir())
 }

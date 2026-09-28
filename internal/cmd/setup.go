@@ -3,9 +3,11 @@ package cmd
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,20 +29,20 @@ type SetupRunner struct {
 	Paths    Paths
 
 	// Flags
-	Interactive  bool
-	NonInteract  bool
-	DBHost       string
-	DBPort       int
-	DBUser       string
-	DBPassword   string
-	DBName       string
-	ExternalURL  string
-	TLSCert      string
-	TLSKey       string
-	SkipDB       bool
-	SkipTLS      bool
-	Reconfigure  bool
-	DryRun       bool
+	Interactive bool
+	NonInteract bool
+	DBHost      string
+	DBPort      int
+	DBUser      string
+	DBPassword  string
+	DBName      string
+	ExternalURL string
+	TLSCert     string
+	TLSKey      string
+	SkipDB      bool
+	SkipTLS     bool
+	Reconfigure bool
+	DryRun      bool
 }
 
 // NewSetupCmd creates the setup cobra command. If runner is nil, a default
@@ -308,7 +310,10 @@ func (r *SetupRunner) printDryRun(isLocalDB bool) error {
 // Preserves existing values — only generates secrets if they don't already exist.
 func (r *SetupRunner) stepConfigure() error {
 	// Load existing values (safe if file doesn't exist yet)
-	existing, _ := r.Env.ReadEnv()
+	existing, err := r.Env.ReadEnv()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 
 	// Interactive mode: prompt for each value
 	if r.Interactive {
@@ -729,6 +734,12 @@ func (r *SetupRunner) writeConfig(existing map[string]string,
 	}
 	if adminPassword != "" {
 		entries["ADMIN_PASSWORD"] = adminPassword
+	}
+
+	for key, value := range existing {
+		if _, managed := entries[key]; !managed {
+			entries[key] = value
+		}
 	}
 
 	if err := r.Env.WriteEnvFile(entries); err != nil {

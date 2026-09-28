@@ -1,10 +1,15 @@
 package cmd
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 )
+
+var envKeyPattern = regexp.MustCompile("^[A-Za-z_][A-Za-z0-9_]*$")
 
 // FileEnvManager implements EnvManager backed by a real file.
 type FileEnvManager struct {
@@ -42,9 +47,9 @@ func ParseEnv(content string) map[string]string {
 		if idx < 0 {
 			continue
 		}
-		key := strings.TrimSpace(line[:idx])
+		key := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line[:idx]), "export "))
 		val := strings.TrimSpace(line[idx+1:])
-		val = strings.Trim(val, "\"'")
+		val = decodeEnvValue(val)
 		env[key] = val
 	}
 	return env
@@ -52,52 +57,59 @@ func ParseEnv(content string) map[string]string {
 
 // WriteEnvKey updates or appends a key in the env file, preserving comments and order.
 func (m *FileEnvManager) WriteEnvKey(key, value string) error {
-	var lines []string
+	return m.WriteEnvFile(map[string]string{key: value})
+}
+
+// WriteEnvFile updates supplied keys while preserving unrelated text and unchanged
+// assignments. New keys are appended in sorted order.
+func (m *FileEnvManager) WriteEnvFile(entries map[string]string) error {
 	data, err := os.ReadFile(m.Path)
-	if err == nil {
-		lines = strings.Split(string(data), "\n")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	encoded := make(map[string]string, len(entries))
+	for key, value := range entries {
+		if !envKeyPattern.MatchString(key) {
+			return fmt.Errorf("invalid environment key %q", key)
+		}
+		encoded[key], err = encodeEnvValue(value)
+		if err != nil {
+			return err
+		}
 	}
 
-	found := false
-	var out []string
-	for _, line := range lines {
-		stripped := strings.TrimSpace(line)
-		if stripped != "" && !strings.HasPrefix(stripped, "#") && strings.Contains(stripped, "=") {
-			k := strings.TrimSpace(stripped[:strings.Index(stripped, "=")])
-			if k == key {
-				out = append(out, key+"="+value)
-				found = true
+	seen := make(map[string]bool)
+	var lines []string
+	if len(data) != 0 {
+		lines = strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	}
+	for i, line := range lines {
+		for key, previous := range ParseEnv(line) {
+			value, updating := entries[key]
+			if !updating {
 				continue
 			}
+			seen[key] = true
+			if value != previous {
+				lines[i] = key + "=" + encoded[key]
+			}
 		}
-		out = append(out, line)
 	}
-	if !found {
-		out = append(out, key+"="+value)
+	var missing []string
+	for key := range entries {
+		if !seen[key] {
+			missing = append(missing, key)
+		}
 	}
-
-	// Ensure file ends with newline
-	content := strings.Join(out, "\n")
-	if !strings.HasSuffix(content, "\n") {
+	sort.Strings(missing)
+	for _, key := range missing {
+		lines = append(lines, key+"="+encoded[key])
+	}
+	content := strings.Join(lines, "\n")
+	if len(missing) != 0 || strings.HasSuffix(string(data), "\n") {
 		content += "\n"
 	}
 	return os.WriteFile(m.Path, []byte(content), 0640)
-}
-
-// WriteEnvFile writes all entries to the env file (replacing contents).
-// Keys are written in sorted order for deterministic output.
-func (m *FileEnvManager) WriteEnvFile(entries map[string]string) error {
-	keys := make([]string, 0, len(entries))
-	for k := range entries {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var sb strings.Builder
-	for _, k := range keys {
-		sb.WriteString(k + "=" + entries[k] + "\n")
-	}
-	return os.WriteFile(m.Path, []byte(sb.String()), 0640)
 }
 
 // MaskSecret masks a secret value for display: first 3 + *** + last 3.
