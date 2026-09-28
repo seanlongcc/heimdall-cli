@@ -22,9 +22,9 @@ func TestRestore_RestoresConfigAndDB(t *testing.T) {
 	fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("-- SQL dump")
 
 	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":  {Stdout: "", ExitCode: 0},
+		"tar xzf":             {Stdout: "", ExitCode: 0},
 		"chown root:heimdall": {Stdout: "", ExitCode: 0},
-		"psql -h":  {Stdout: "", ExitCode: 0},
+		"psql -h":             {Stdout: "", ExitCode: 0},
 	}}
 
 	out := new(bytes.Buffer)
@@ -84,9 +84,9 @@ func TestRestore_CallsPsqlWithCorrectArgs(t *testing.T) {
 	fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("SQL")
 
 	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":  {Stdout: "", ExitCode: 0},
+		"tar xzf":             {Stdout: "", ExitCode: 0},
 		"chown root:heimdall": {Stdout: "", ExitCode: 0},
-		"psql -h":  {Stdout: "", ExitCode: 0},
+		"psql -h":             {Stdout: "", ExitCode: 0},
 	}}
 
 	r := &RestoreRunner{
@@ -106,12 +106,16 @@ func TestRestore_CallsPsqlWithCorrectArgs(t *testing.T) {
 		ErrOut: new(bytes.Buffer),
 	}
 
-	_ = r.Run("/tmp/backup.tar.gz")
+	require.NoError(t, r.Run("/tmp/backup.tar.gz"))
 
 	found := false
 	for _, call := range exec.Calls {
 		if call.Name == "psql" {
 			found = true
+			assert.Equal(t, []string{
+				"-h", "db.host", "-p", "5433", "-U", "admin", "-d", "testdb",
+				"-X", "-v", "ON_ERROR_STOP=1", "-f", "/tmp/heimdall-restore--fake/database.sql",
+			}, call.Args)
 			if call.Env["PGPASSWORD"] != "pass123" {
 				t.Errorf("expected PGPASSWORD=pass123, got: %s", call.Env["PGPASSWORD"])
 			}
@@ -174,14 +178,14 @@ func TestRestore_CorruptArchive(t *testing.T) {
 	}
 }
 
-func TestRestore_SkipsDBWithoutPassword(t *testing.T) {
+func TestRestore_RejectsDBWithoutPassword(t *testing.T) {
 	fs := NewFakeFileSystem()
 	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
 	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("PORT=3000\n")
 	fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("SQL")
 
 	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":  {Stdout: "", ExitCode: 0},
+		"tar xzf":             {Stdout: "", ExitCode: 0},
 		"chown root:heimdall": {Stdout: "", ExitCode: 0},
 	}}
 
@@ -197,7 +201,11 @@ func TestRestore_SkipsDBWithoutPassword(t *testing.T) {
 		ErrOut: new(bytes.Buffer),
 	}
 
-	_ = r.Run("/tmp/backup.tar.gz")
+	assert.Error(t, r.Run("/tmp/backup.tar.gz"))
+	assert.NotContains(t, out.String(), "Restart the service")
+	for _, call := range exec.Calls {
+		assert.NotEqual(t, "psql", call.Name)
+	}
 
 	if !strings.Contains(out.String(), "skipped (no password in restored config)") {
 		t.Errorf("expected skip message, got: %s", out.String())
@@ -295,7 +303,7 @@ func TestRestore_DatabaseRestoreFailure(t *testing.T) {
 	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
 		"tar xzf":             {ExitCode: 0},
 		"chown root:heimdall": {ExitCode: 0},
-		"psql -h":             {Stdout: "", ExitCode: 1}, // psql fails
+		"psql -h":             {Stdout: "", ExitCode: 3}, // ON_ERROR_STOP SQL error
 	}}
 
 	out := new(bytes.Buffer)
@@ -318,8 +326,11 @@ func TestRestore_DatabaseRestoreFailure(t *testing.T) {
 	}
 
 	err := r.Run("/tmp/backup.tar.gz")
-	assert.NoError(t, err) // Run itself doesn't return error for DB failure
+	assert.Error(t, err)
 	assert.Contains(t, errOut.String(), "restore FAILED")
+	assert.NotContains(t, out.String(), "Database: restored")
+	assert.NotContains(t, out.String(), "Restart the service")
+	exec.Verify(t)
 }
 
 func TestRestore_DatabaseRestoreExecError(t *testing.T) {
@@ -353,8 +364,10 @@ func TestRestore_DatabaseRestoreExecError(t *testing.T) {
 	}
 
 	err := r.Run("/tmp/backup.tar.gz")
-	assert.NoError(t, err)
+	assert.Error(t, err)
 	assert.Contains(t, errOut.String(), "restore FAILED")
+	assert.NotContains(t, r.Out.(*bytes.Buffer).String(), "Restart the service")
+	exec.Verify(t)
 }
 
 func TestRestore_RootCheckFails(t *testing.T) {
@@ -393,26 +406,39 @@ func TestRestore_ConfirmPromptError(t *testing.T) {
 }
 
 func TestRestore_ConfigCopyFails(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	// backend.env does NOT exist in the extracted dir — CopyFile will fail
+	for _, exists := range []bool{false, true} {
+		t.Run(fmt.Sprintf("exists=%t", exists), func(t *testing.T) {
+			fs := NewFakeFileSystem()
+			fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
+			fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("SQL")
+			if exists {
+				// The path exists, but cannot be copied as a file.
+				fs.Dirs["/tmp/heimdall-restore--fake/backend.env"] = true
+			}
 
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf": {ExitCode: 0},
-	}}
+			exec := &FakeExecRunner{Results: map[string]FakeExecResult{
+				"tar xzf": {ExitCode: 0},
+			}}
 
-	out := new(bytes.Buffer)
-	r := &RestoreRunner{
-		Exec:   exec,
-		Env:    &FakeEnvManager{Env: map[string]string{}, Path: "/etc/heimdall-server/backend.env"},
-		FS:     fs,
-		Out:    out,
-		ErrOut: new(bytes.Buffer),
+			out := new(bytes.Buffer)
+			r := &RestoreRunner{
+				Exec:   exec,
+				Env:    &FakeEnvManager{Env: map[string]string{"DATABASE_PASSWORD": "secret"}, Path: "/etc/heimdall-server/backend.env"},
+				FS:     fs,
+				Out:    out,
+				ErrOut: new(bytes.Buffer),
+			}
+
+			err := r.Run("/tmp/backup.tar.gz")
+			assert.ErrorIs(t, err, os.ErrNotExist)
+			assert.NotContains(t, out.String(), "Config:   restored")
+			assert.NotContains(t, out.String(), "Restart the service")
+			assert.Contains(t, r.ErrOut.(*bytes.Buffer).String(), "Config:   restore failed:")
+			for _, call := range exec.Calls {
+				assert.NotEqual(t, "psql", call.Name, "copy failure must stop database restore")
+			}
+		})
 	}
-
-	err := r.Run("/tmp/backup.tar.gz")
-	assert.NoError(t, err) // doesn't fail — just doesn't restore config
-	assert.NotContains(t, out.String(), "Config:   restored")
 }
 
 func TestRestore_ReadEnvFailsAfterRestore(t *testing.T) {
@@ -427,19 +453,22 @@ func TestRestore_ReadEnvFailsAfterRestore(t *testing.T) {
 	}}
 
 	errOut := new(bytes.Buffer)
-	// FakeEnvManager with a ReadEnv that will fail after CopyFile
-	// We can't easily make FakeEnvManager.ReadEnv fail, but we can
-	// test the "no password" path by having an empty env
+	// CopyFile writes only to the fake filesystem; the real env read fails.
 	r := &RestoreRunner{
 		Exec:   exec,
-		Env:    &FakeEnvManager{Env: map[string]string{}, Path: "/etc/heimdall-server/backend.env"},
+		Env:    &FileEnvManager{Path: filepath.Join(t.TempDir(), "backend.env")},
 		FS:     fs,
 		Out:    new(bytes.Buffer),
 		ErrOut: errOut,
 	}
 
 	err := r.Run("/tmp/backup.tar.gz")
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assert.Contains(t, errOut.String(), "Database: could not read restored config:")
+	assert.NotContains(t, r.Out.(*bytes.Buffer).String(), "Restart the service")
+	for _, call := range exec.Calls {
+		assert.NotEqual(t, "psql", call.Name)
+	}
 }
 
 func TestRestore_NoPrompterSkipsConfirmation(t *testing.T) {

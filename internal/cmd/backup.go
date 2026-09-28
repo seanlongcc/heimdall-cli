@@ -12,12 +12,12 @@ import (
 
 // BackupRunner implements the backup command.
 type BackupRunner struct {
-	Exec       ExecRunner
-	Env        EnvManager
-	FS         FileSystem
-	Out        io.Writer
-	ErrOut     io.Writer
-	CheckRoot  func() error
+	Exec      ExecRunner
+	Env       EnvManager
+	FS        FileSystem
+	Out       io.Writer
+	ErrOut    io.Writer
+	CheckRoot func() error
 }
 
 // NewBackupCmd creates the "backup" command.
@@ -93,13 +93,11 @@ func (r *BackupRunner) Run(outputDir string) error {
 
 	// Copy backend.env
 	envPath := r.Env.GetEnvFilePath()
-	if r.FS.Exists(envPath) {
-		if err := r.FS.CopyFile(envPath, filepath.Join(backupDir, "backend.env")); err != nil {
-			fmt.Fprintf(r.ErrOut, "Config:   copy failed: %v\n", err)
-		} else {
-			fmt.Fprintln(r.Out, "Config:   backed up")
-		}
+	if err := r.FS.CopyFile(envPath, filepath.Join(backupDir, "backend.env")); err != nil {
+		fmt.Fprintf(r.ErrOut, "Config:   copy failed: %v\n", err)
+		return fmt.Errorf("failed to back up config: %w", err)
 	}
+	fmt.Fprintln(r.Out, "Config:   backed up")
 
 	// Database backup
 	if dbCfg.Password != "" {
@@ -109,6 +107,10 @@ func (r *BackupRunner) Run(outputDir string) error {
 			"-h", dbCfg.Host, "-p", dbCfg.PortStr(), "-U", dbCfg.User, dbCfg.DBName, "-f", dumpFile)
 		if err != nil || exitCode != 0 {
 			fmt.Fprintln(r.ErrOut, "Database: backup FAILED")
+			if err != nil {
+				return fmt.Errorf("failed to back up database: %w", err)
+			}
+			return fmt.Errorf("failed to back up database: pg_dump exited with status %d", exitCode)
 		} else {
 			fmt.Fprintln(r.Out, "Database: backed up")
 		}

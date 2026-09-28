@@ -107,16 +107,14 @@ func (r *RestoreRunner) Run(archive string) error {
 	// Restore config
 	envBackup = filepath.Join(restoreDir, "backend.env")
 	envDest := r.Env.GetEnvFilePath()
-	if r.FS.Exists(envBackup) {
-		if err := r.FS.CopyFile(envBackup, envDest); err != nil {
-			fmt.Fprintf(r.ErrOut, "Config:   restore failed: %v\n", err)
-		} else {
-			// Set permissions and ownership
-			_ = os.Chmod(envDest, 0640)
-			r.Exec.Run("chown", "root:heimdall", envDest)
-			fmt.Fprintln(r.Out, "Config:   restored")
-		}
+	if err := r.FS.CopyFile(envBackup, envDest); err != nil {
+		fmt.Fprintf(r.ErrOut, "Config:   restore failed: %v\n", err)
+		return fmt.Errorf("failed to restore config: %w", err)
 	}
+	// Set permissions and ownership
+	_ = os.Chmod(envDest, 0640)
+	r.Exec.Run("chown", "root:heimdall", envDest)
+	fmt.Fprintln(r.Out, "Config:   restored")
 
 	// Restore database
 	sqlBackup := filepath.Join(restoreDir, "database.sql")
@@ -125,20 +123,27 @@ func (r *RestoreRunner) Run(archive string) error {
 		env, err := r.Env.ReadEnv()
 		if err != nil {
 			fmt.Fprintf(r.ErrOut, "Database: could not read restored config: %v\n", err)
+			return fmt.Errorf("failed to read restored config: %w", err)
 		} else {
 			dbCfg := ExtractDBConfig(env)
 
 			if dbCfg.Password != "" {
 				pgEnv := dbCfg.PgEnv()
 				_, exitCode, err := r.Exec.RunWithEnv(pgEnv, "psql",
-					"-h", dbCfg.Host, "-p", dbCfg.PortStr(), "-U", dbCfg.User, "-d", dbCfg.DBName, "-f", sqlBackup)
+					"-h", dbCfg.Host, "-p", dbCfg.PortStr(), "-U", dbCfg.User, "-d", dbCfg.DBName,
+					"-X", "-v", "ON_ERROR_STOP=1", "-f", sqlBackup)
 				if err != nil || exitCode != 0 {
 					fmt.Fprintln(r.ErrOut, "Database: restore FAILED")
+					if err != nil {
+						return fmt.Errorf("failed to restore database: %w", err)
+					}
+					return fmt.Errorf("failed to restore database: psql exited with status %d", exitCode)
 				} else {
 					fmt.Fprintln(r.Out, "Database: restored")
 				}
 			} else {
 				fmt.Fprintln(r.Out, "Database: skipped (no password in restored config)")
+				return fmt.Errorf("cannot restore database.sql without a password in restored config")
 			}
 		}
 	}

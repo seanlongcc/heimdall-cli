@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -113,31 +114,83 @@ func TestBackup_CallsPgDumpWithCorrectArgs(t *testing.T) {
 }
 
 func TestBackup_HandlesPgDumpFailure(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/etc/heimdall-server/backend.env"] = []byte("PORT=3000\n")
+	for _, failure := range []struct {
+		name   string
+		result FakeExecResult
+	}{
+		{"exit status", FakeExecResult{ExitCode: 1}},
+		{"exec error", FakeExecResult{Err: fmt.Errorf("pg_dump not found")}},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			fs := NewFakeFileSystem()
+			fs.Files["/etc/heimdall-server/backend.env"] = []byte("PORT=3000\n")
 
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"pg_dump -h": {Stdout: "", ExitCode: 1, Err: nil},
-		"tar czf":    {Stdout: "", ExitCode: 0},
-	}}
+			exec := &FakeExecRunner{Results: map[string]FakeExecResult{
+				"pg_dump -h": failure.result,
+			}}
 
-	errOut := new(bytes.Buffer)
+			errOut := new(bytes.Buffer)
+			r := &BackupRunner{
+				Exec: exec,
+				Env: &FakeEnvManager{
+					Env:  map[string]string{"DATABASE_PASSWORD": "secret"},
+					Path: "/etc/heimdall-server/backend.env",
+				},
+				FS:     fs,
+				Out:    new(bytes.Buffer),
+				ErrOut: errOut,
+			}
+
+			assert.Error(t, r.Run(t.TempDir()))
+			assert.NotContains(t, r.Out.(*bytes.Buffer).String(), "Backup saved to:")
+			for _, call := range exec.Calls {
+				assert.NotEqual(t, "tar", call.Name, "a failed database dump must not be archived")
+			}
+			exec.Verify(t)
+
+			if !strings.Contains(errOut.String(), "backup FAILED") {
+				t.Errorf("expected FAILED message on stderr, got: %s", errOut.String())
+			}
+		})
+	}
+}
+
+func TestBackup_ConfigCopyFailure(t *testing.T) {
+	for _, exists := range []bool{false, true} {
+		t.Run(fmt.Sprintf("exists=%t", exists), func(t *testing.T) {
+			fs := NewFakeFileSystem()
+			if exists {
+				// The path exists, but cannot be copied as a file.
+				fs.Dirs["/etc/heimdall-server/backend.env"] = true
+			}
+			exec := &FakeExecRunner{}
+			r := &BackupRunner{
+				Exec:   exec,
+				Env:    &FakeEnvManager{Env: map[string]string{"DATABASE_PASSWORD": "secret"}},
+				FS:     fs,
+				Out:    new(bytes.Buffer),
+				ErrOut: new(bytes.Buffer),
+			}
+
+			assert.ErrorIs(t, r.Run(t.TempDir()), os.ErrNotExist)
+			assert.Empty(t, exec.Calls, "copy failure must stop the dump and archive")
+			assert.Contains(t, r.ErrOut.(*bytes.Buffer).String(), "Config:   copy failed:")
+			assert.NotContains(t, r.Out.(*bytes.Buffer).String(), "Backup saved to:")
+		})
+	}
+}
+
+func TestBackup_ConfigReadFailure(t *testing.T) {
+	exec := &FakeExecRunner{}
 	r := &BackupRunner{
-		Exec: exec,
-		Env: &FakeEnvManager{
-			Env:  map[string]string{"DATABASE_PASSWORD": "secret"},
-			Path: "/etc/heimdall-server/backend.env",
-		},
-		FS:     fs,
+		Exec:   exec,
+		Env:    &FileEnvManager{Path: t.TempDir()},
+		FS:     NewFakeFileSystem(),
 		Out:    new(bytes.Buffer),
-		ErrOut: errOut,
+		ErrOut: new(bytes.Buffer),
 	}
-
-	_ = r.Run(t.TempDir())
-
-	if !strings.Contains(errOut.String(), "backup FAILED") {
-		t.Errorf("expected FAILED message on stderr, got: %s", errOut.String())
-	}
+	assert.Error(t, r.Run(t.TempDir()))
+	assert.Empty(t, exec.Calls)
 }
 
 func TestBackup_SkipsDBWithoutPassword(t *testing.T) {
@@ -160,7 +213,8 @@ func TestBackup_SkipsDBWithoutPassword(t *testing.T) {
 		ErrOut: new(bytes.Buffer),
 	}
 
-	_ = r.Run(t.TempDir())
+	assert.NoError(t, r.Run(t.TempDir()))
+	assert.Contains(t, out.String(), "Backup saved to:")
 
 	if !strings.Contains(out.String(), "skipped (no password configured)") {
 		t.Errorf("expected skip message, got: %s", out.String())
