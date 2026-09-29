@@ -546,3 +546,9 @@ func (s *caddyStartFailure) Start(unit string) error {
 	}
 	return s.FakeSystemdRunner.Start(unit)
 }
+
+func TestBundledCaddyCanonicalWhitespace(t *testing.T) {
+	config, err := renderBundledCaddy(map[string]string{"PORT": "3210", "EXTERNAL_URL": "https://heimdall.example.test", "HEIMDALL_TLS_MODE": "internal"})
+	require.NoError(t, err)
+	require.Equal(t, "{\n\tadmin unix//run/heimdall-caddy/admin.sock\n\tskip_install_trust\n}\n\"https://heimdall.example.test\" {\n\ttls internal\n\treverse_proxy \"127.0.0.1:3210\"\n}\n", config)
+}

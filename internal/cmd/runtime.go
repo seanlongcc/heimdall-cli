@@ -65,7 +65,17 @@ type systemdRunner struct{}
 func (r *systemdRunner) IsActive(service string) (bool, error) {
 	c := exec.Command("systemctl", "is-active", service)
 	out, err := c.Output()
-	return strings.TrimSpace(string(out)) == "active", err
+	state := strings.TrimSpace(string(out))
+	if err == nil && state == "active" {
+		return true, nil
+	}
+	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 3 && (state == "inactive" || state == "failed") {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, fmt.Errorf("unexpected systemctl is-active state %q for %s", state, service)
 }
 func (r *systemdRunner) Start(service string) error {
 	return exec.Command("systemctl", "start", service).Run()

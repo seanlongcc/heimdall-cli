@@ -285,3 +285,73 @@ func TestRealRootPathsAndDryRun(t *testing.T) {
 		require.ErrorContains(t, err, filepath.Join(paths, "missing", "runtime", "postgresql", "bin", "psql"))
 	}
 }
+
+func TestRealSystemdIsActiveStates(t *testing.T) {
+	skipIfWindows(t)
+	for _, tc := range []struct {
+		name, state, status string
+		active, fail        bool
+	}{
+		{"active", "active", "0", true, false}, {"inactive", "inactive", "3", false, false}, {"failed unit", "failed", "3", false, false},
+		{"manager failure", "", "1", false, true}, {"unexpected output", "surprise", "0", false, true},
+		{"inactive wrong exit", "inactive", "1", false, true}, {"active wrong exit", "active", "3", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "systemctl"), []byte("#!/bin/sh\nprintf '%s\\n' \"$SYSTEMCTL_STATE\"\nexit \"$SYSTEMCTL_STATUS\"\n"), 0755))
+			t.Setenv("PATH", dir)
+			t.Setenv("SYSTEMCTL_STATE", tc.state)
+			t.Setenv("SYSTEMCTL_STATUS", tc.status)
+			active, err := (&systemdRunner{}).IsActive(bundledPGService)
+			require.Equal(t, tc.active, active)
+			if tc.fail {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+	t.Run("missing executable", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		active, err := (&systemdRunner{}).IsActive(bundledPGService)
+		require.False(t, active)
+		require.Error(t, err)
+	})
+}
+
+func TestRealSystemdInactiveSetupAndStatus(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	t.Setenv("SYSTEMCTL_FIXTURE", dir)
+	t.Setenv("PATH", dir)
+	script := `#!/bin/sh
+case "$1" in
+ is-active)
+  state=inactive
+  if [ -f "$SYSTEMCTL_FIXTURE/$2" ]; then IFS= read -r state < "$SYSTEMCTL_FIXTURE/$2"; fi
+  printf '%s\n' "$state"
+  [ "$state" = active ] && exit 0
+  exit 3;;
+ show) printf '%s\n' disabled;;
+ start|restart) printf 'active\n' > "$SYSTEMCTL_FIXTURE/$2";;
+ stop) printf 'inactive\n' > "$SYSTEMCTL_FIXTURE/$2";;
+ enable|reload) :;;
+ *) exit 1;;
+esac
+printf '%s\n' "$*" >> "$SYSTEMCTL_FIXTURE/actions"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0755))
+	setup := bundledSetupFixture(t)
+	setup.Systemd = &systemdRunner{}
+	out := new(bytes.Buffer)
+	status := &StatusRunner{Exec: setup.Exec, Systemd: setup.Systemd, Env: setup.Env, FS: setup.FS, DB: setup.DB, Paths: setup.Paths, Out: out, JSON: true}
+	require.NoError(t, status.Run())
+	require.Contains(t, out.String(), `"heimdall-postgresql": false`)
+	require.Contains(t, out.String(), `"heimdall-caddy": false`)
+	require.NoError(t, setup.Run())
+	data, err := os.ReadFile(filepath.Join(dir, "actions"))
+	require.NoError(t, err)
+	for _, action := range []string{"start heimdall-postgresql\n", "start heimdall-caddy\n", "restart heimdall-server\n"} {
+		require.Contains(t, string(data), action)
+	}
+}

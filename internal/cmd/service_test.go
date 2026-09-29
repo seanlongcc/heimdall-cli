@@ -189,3 +189,34 @@ func TestServiceRestart_SystemdFails(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to restart service")
 }
+
+func TestServiceStopLeavesSelectedPrivateServicesRunning(t *testing.T) {
+	r, sd, exec, out := newServiceRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{"HEIMDALL_DATABASE_MODE": "bundled", "HEIMDALL_PROXY_MODE": "bundled"}
+	sd.ActiveServices[bundledPGService], sd.ActiveServices[bundledCaddyService] = true, true
+	require.NoError(t, r.Stop())
+	require.Equal(t, []string{"stop:heimdall-server"}, sd.Actions)
+	require.Empty(t, exec.Calls)
+	require.True(t, sd.ActiveServices[bundledPGService])
+	require.True(t, sd.ActiveServices[bundledCaddyService])
+	require.Contains(t, out.String(), "Database and proxy services remain running")
+}
+
+func TestServiceDiagReportsOnlySelectedPrivateUnits(t *testing.T) {
+	for _, mode := range []string{"bundled", "external"} {
+		t.Run(mode, func(t *testing.T) {
+			r, sd, _, out := newServiceRunner()
+			r.Env.(*FakeEnvManager).Env = map[string]string{"HEIMDALL_DATABASE_MODE": mode, "HEIMDALL_PROXY_MODE": mode}
+			sd.ActiveServices[bundledPGService] = true
+			require.NoError(t, r.Diag())
+			require.Empty(t, sd.Actions)
+			if mode == "bundled" {
+				require.Contains(t, out.String(), "heimdall-postgresql running: true (journalctl -u heimdall-postgresql)")
+				require.Contains(t, out.String(), "heimdall-caddy running: false (journalctl -u heimdall-caddy)")
+			} else {
+				require.NotContains(t, out.String(), "heimdall-postgresql")
+				require.NotContains(t, out.String(), "heimdall-caddy")
+			}
+		})
+	}
+}

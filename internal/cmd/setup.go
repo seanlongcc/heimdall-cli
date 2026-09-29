@@ -1585,24 +1585,24 @@ func renderPrivateCaddy(env map[string]string, dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	global := "{\n    admin unix//run/heimdall-caddy/admin.sock\n    skip_install_trust\n"
+	global := "{\n\tadmin unix//run/heimdall-caddy/admin.sock\n\tskip_install_trust\n"
 	tlsLine := ""
 	switch env["HEIMDALL_TLS_MODE"] {
 	case "internal":
-		tlsLine = "    tls internal\n"
+		tlsLine = "\ttls internal\n"
 	case "custom":
-		tlsLine = fmt.Sprintf("    tls %s %s\n", strconv.Quote(dir+"/certs/server.crt"), strconv.Quote(dir+"/certs/server.key"))
+		tlsLine = fmt.Sprintf("\ttls %s %s\n", strconv.Quote(dir+"/certs/server.crt"), strconv.Quote(dir+"/certs/server.key"))
 	case "acme":
 		if email := env["ADMIN_EMAIL"]; email != "" {
 			if strings.ContainsAny(email, "\r\n{}") {
 				return "", fmt.Errorf("ADMIN_EMAIL contains unsafe characters")
 			}
-			global += "    email " + strconv.Quote(email) + "\n"
+			global += "\temail " + strconv.Quote(email) + "\n"
 		}
 	default:
 		return "", fmt.Errorf("HEIMDALL_TLS_MODE must be acme, internal or custom")
 	}
-	return global + "}\n" + strconv.Quote(u.Scheme+"://"+u.Host) + " {\n" + tlsLine + fmt.Sprintf("    reverse_proxy %s\n}\n", strconv.Quote("127.0.0.1:"+strconv.Itoa(port))), nil
+	return global + "}\n" + strconv.Quote(u.Scheme+"://"+u.Host) + " {\n" + tlsLine + fmt.Sprintf("\treverse_proxy %s\n}\n", strconv.Quote("127.0.0.1:"+strconv.Itoa(port))), nil
 }
 
 type savedFile struct {
@@ -1873,10 +1873,29 @@ func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 		return err
 	}
 	if !r.SkipTLS && r.ProxyMode != "bundled" {
-		if _, err := validatePublicURL(env["EXTERNAL_URL"]); err != nil {
+		target, err := validatePublicURL(env["EXTERNAL_URL"])
+		if err != nil {
+			return err
+		}
+		if r.ProxyMode == "external" {
+			proxyPort := 443
+			if target.Scheme == "http" {
+				proxyPort = 80
+			}
+			if target.Port() != "" {
+				proxyPort, _ = strconv.Atoi(target.Port())
+			}
+			if err := r.rejectPrivateEndpoint(target.Hostname(), proxyPort, bundledCaddyService); err != nil {
+				return err
+			}
+		}
+	}
+	if !r.SkipDB && r.DatabaseMode == "external" {
+		if err := r.rejectPrivateEndpoint(r.DBHost, r.DBPort, bundledPGService); err != nil {
 			return err
 		}
 	}
+
 	before, err := snapshotFile(r.FS, r.Env.GetEnvFilePath())
 	if err != nil {
 		return err
@@ -2056,7 +2075,7 @@ func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 			fmt.Fprintln(r.Out, "  Import the private Caddy CA where needed:", bundledCaddyRoot)
 		}
 	}
-	// Both selected replacements are now validated and active. Retain old state.
+	// Replacements passed their applicable preflight checks. Retain deselected state.
 	for _, selection := range []struct {
 		skip            bool
 		mode, key, unit string
@@ -2116,4 +2135,90 @@ func validatePublicURL(raw string) (*url.URL, error) {
 		}
 	}
 	return u, nil
+}
+
+// Reject a demonstrably dependent local endpoint before disabling its provider.
+// A public hostname alone does not establish that a remote proxy depends on us.
+func (r *SetupRunner) rejectPrivateEndpoint(host string, port int, unit string) error {
+	var addresses []net.IP
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		addresses = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+	} else if ip := net.ParseIP(host); ip != nil {
+		local := ip.IsLoopback()
+		if !local {
+			interfaces, err := net.InterfaceAddrs()
+			if err != nil {
+				return fmt.Errorf("checking local addresses: %w", err)
+			}
+			for _, address := range interfaces {
+				iface, _, err := net.ParseCIDR(address.String())
+				if err == nil && iface.Equal(ip) {
+					local = true
+					break
+				}
+			}
+		}
+		if local {
+			addresses = []net.IP{ip}
+		}
+	}
+	if len(addresses) == 0 {
+		return nil
+	}
+	active, err := r.Systemd.IsActive(unit)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return nil
+	}
+	pid, err := r.Systemd.ShowProperty(unit, "MainPID")
+	if err != nil {
+		return err
+	}
+	pid = strings.TrimSpace(pid)
+	number, err := strconv.Atoi(pid)
+	if err != nil || number <= 0 {
+		return fmt.Errorf("cannot verify external endpoint independence: %s has no valid MainPID", unit)
+	}
+	out, code, err := r.Exec.Run("ss", "-H", "-ltnp", "sport = :"+strconv.Itoa(port))
+	if err != nil || code != 0 {
+		return fmt.Errorf("cannot verify external endpoint independence on port %d (ss exit %d): %v", port, code, err)
+	}
+	if strings.TrimSpace(out) == "" {
+		return nil
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[0] != "LISTEN" {
+			return fmt.Errorf("cannot parse listener while checking external endpoint on port %d", port)
+		}
+		address, listenPort, err := net.SplitHostPort(fields[3])
+		if err != nil || listenPort != strconv.Itoa(port) {
+			return fmt.Errorf("unexpected listener while checking external endpoint on port %d", port)
+		}
+		listenIP := net.ParseIP(address)
+		if address != "*" && listenIP == nil {
+			return fmt.Errorf("invalid listener address while checking external endpoint on port %d", port)
+		}
+		matches := false
+		for _, ip := range addresses {
+			if address == "*" || listenIP.Equal(ip) || (listenIP.IsUnspecified() && (listenIP.To4() == nil || ip.To4() != nil)) {
+				matches = true
+				break
+			}
+		}
+		if matches {
+			owners := regexp.MustCompile(`pid=([0-9]+),`).FindAllStringSubmatch(line, -1)
+			if len(owners) == 0 {
+				return fmt.Errorf("cannot identify listener owner for external endpoint %s:%d", host, port)
+			}
+			for _, owner := range owners {
+				if owner[1] == pid {
+					return fmt.Errorf("external endpoint %s:%d is still served by %s; choose an independent endpoint before deselecting that service", host, port, unit)
+				}
+			}
+		}
+	}
+	return nil
 }

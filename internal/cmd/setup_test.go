@@ -1771,6 +1771,8 @@ func TestBundledSetupTransitionsAndMigrationFailure(t *testing.T) {
 			} else {
 				r.DatabaseMode = "external"
 				r.ProxyMode = "external"
+				r.DBHost, r.DBPort = "db.external.test", 5432
+				r.flagChanged = map[string]bool{"db-host": true, "db-port": true}
 			}
 			if target == "migration failure" {
 				exec.Results["heimdall-server-db-setup"] = FakeExecResult{ExitCode: 1}
@@ -1859,4 +1861,102 @@ func TestBundledFailedSetupRestoresPreviousRolePassword(t *testing.T) {
 		}
 	}
 	require.Equal(t, []string{"db_pass=new-password", "db_pass=keep-password"}, passwords)
+}
+
+func TestBundledExternalTransitionEndpointIndependence(t *testing.T) {
+	for _, tc := range []struct {
+		name, host, address, pid string
+		proxy, fail              bool
+	}{
+		{"private database", "127.0.0.1", "127.0.0.1", "123", false, true},
+		{"private localhost database", "localhost", "127.0.0.1", "123", false, true},
+		{"private wildcard database", "127.0.0.1", "0.0.0.0", "123", false, true},
+		{"operator localhost database", "localhost", "127.0.0.1", "456", false, false},
+		{"other loopback database", "127.0.0.2", "127.0.0.1", "123", false, false},
+		{"private HTTPS proxy", "127.0.0.1", "127.0.0.1", "123", true, true},
+		{"operator localhost proxy", "localhost", "127.0.0.1", "456", true, false},
+		{"remote load balancer same URL", "heimdall.example.test", "0.0.0.0", "123", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := bundledSetupFixture(t)
+			fs := r.FS.(*FakeFileSystem)
+			sd := r.Systemd.(*FakeSystemdRunner)
+			exec := r.Exec.(*FakeExecRunner)
+			unit, port := bundledPGService, 55432
+			if tc.proxy {
+				unit, port = bundledCaddyService, 443
+				r.ProxyMode = "external"
+				r.SkipDB = true
+				r.ExternalURL = "https://" + tc.host
+			} else {
+				r.DatabaseMode = "external"
+				r.SkipTLS = true
+				r.DBHost = tc.host
+				r.flagChanged = map[string]bool{"db-host": true}
+			}
+			sd.ActiveServices[unit] = true
+			sd.Properties[unit+":MainPID"] = "123"
+			exec.Results[fmt.Sprintf("ss -H -ltnp sport = :%d", port)] = FakeExecResult{Stdout: fmt.Sprintf("LISTEN 0 100 %s:%d 0.0.0.0:* users:((\"listener\",pid=%s,fd=1))", tc.address, port, tc.pid)}
+			// The same port can have an independent listener on another loopback address.
+			if tc.name == "other loopback database" {
+				result := exec.Results["ss -H -ltnp sport = :55432"]
+				result.Stdout += "\nLISTEN 0 100 127.0.0.2:55432 0.0.0.0:* users:((\"other\",pid=456,fd=1))"
+				exec.Results["ss -H -ltnp sport = :55432"] = result
+			}
+			before, _ := r.Env.ReadEnv()
+			files := map[string]string{}
+			for path, data := range fs.Files {
+				files[path] = string(data)
+			}
+			err := r.Run()
+			if tc.fail {
+				require.ErrorContains(t, err, "still served by "+unit)
+				require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+				require.Empty(t, sd.Actions)
+				require.Empty(t, fs.Dirs)
+				after := map[string]string{}
+				for path, data := range fs.Files {
+					after[path] = string(data)
+				}
+				require.Equal(t, files, after)
+				for _, call := range exec.Calls {
+					require.True(t, call.Name == "ss" || (call.Name == "systemctl" && len(call.Args) == 1 && call.Args[0] == "show-environment"), "unexpected call before refusing dependent endpoint: %+v", call)
+				}
+			} else {
+				require.NoError(t, err)
+				disabled := false
+				for _, call := range exec.Calls {
+					if call.Name == "systemctl" && strings.Join(call.Args, " ") == "disable --now "+unit {
+						disabled = true
+					}
+				}
+				require.True(t, disabled, "old private service should be deselected only after independent replacement validation")
+			}
+		})
+	}
+}
+
+func TestBundledExternalEndpointInspectionErrorsDoNotDisableServices(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result FakeExecResult
+	}{
+		{"ss failure", FakeExecResult{ExitCode: 1}}, {"missing ss", FakeExecResult{Err: fmt.Errorf("not found")}},
+		{"malformed", FakeExecResult{Stdout: "unexpected"}},
+		{"unknown owner", FakeExecResult{Stdout: "LISTEN 0 100 127.0.0.1:55432 0.0.0.0:*"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := bundledSetupFixture(t)
+			r.DatabaseMode = "external"
+			r.SkipTLS = true
+			sd := r.Systemd.(*FakeSystemdRunner)
+			sd.ActiveServices[bundledPGService] = true
+			sd.Properties[bundledPGService+":MainPID"] = "123"
+			r.Exec.(*FakeExecRunner).Results["ss -H -ltnp sport = :55432"] = tc.result
+			before, _ := r.Env.ReadEnv()
+			require.Error(t, r.Run())
+			require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+			require.Empty(t, sd.Actions)
+		})
+	}
 }
