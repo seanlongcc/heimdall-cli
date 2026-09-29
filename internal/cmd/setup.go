@@ -525,6 +525,9 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 			// fall through to the full wizard below (existing values as defaults)
 		case 2: // Start fresh — clear existing and run full wizard
 			existing = map[string]string{}
+			if !r.flagChanged["db-password"] {
+				r.DBPassword = ""
+			}
 		}
 	}
 

@@ -1048,6 +1048,59 @@ func TestInteractive_StartFresh(t *testing.T) {
 	assert.NotEqual(t, "old-api", env["API_KEY_SECRET"], "start fresh generates new API secret")
 }
 
+func TestInteractive_StartFreshPasswordDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		dbChoice int
+		password string
+	}{
+		{"local Enter", 0, ""},
+		{"external Enter", 1, ""},
+		{"local explicit flag", 0, "explicit-pass"},
+		{"external explicit flag", 1, "explicit-pass"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, out, _ := newTestSetupRunner()
+			r.Env.(*FakeEnvManager).Env = map[string]string{
+				"DATABASE_HOST":     "old-host.example.com",
+				"DATABASE_PASSWORD": "old-pass",
+				"JWT_SECRET":        "old-jwt",
+				"API_KEY_SECRET":    "old-api",
+			}
+			r.Prompter = &FakePrompter{
+				IsTTY: true,
+				Selects: map[string]int{
+					"What would you like to do?": 2,
+					"Database setup":             tc.dbChoice,
+					"TLS/SSL setup":              3,
+				},
+			}
+			db := &recordingDBConnector{}
+			r.DB = db
+			cmd := NewSetupCmd(r)
+			args := []string{"--interactive", "--reconfigure"}
+			if tc.password != "" {
+				args = append(args, "--db-password="+tc.password)
+			}
+			cmd.SetArgs(args)
+			require.NoError(t, cmd.Execute())
+
+			env := r.Env.(*FakeEnvManager).Env
+			if tc.password == "" {
+				assert.NotEmpty(t, env["DATABASE_PASSWORD"])
+				assert.NotEqual(t, "old-pass", env["DATABASE_PASSWORD"])
+				assert.Contains(t, out.String(), "DATABASE_PASSWORD auto-generated")
+			} else {
+				assert.Equal(t, tc.password, env["DATABASE_PASSWORD"])
+				assert.NotContains(t, out.String(), "DATABASE_PASSWORD auto-generated")
+			}
+			assert.NotEqual(t, "old-jwt", env["JWT_SECRET"])
+			assert.NotEqual(t, "old-api", env["API_KEY_SECRET"])
+			assert.Zero(t, db.connections)
+		})
+	}
+}
+
 func TestWriteConfig_AdminPasswordPreserved(t *testing.T) {
 	r, _, _ := newTestSetupRunner()
 	r.Env.(*FakeEnvManager).Env = map[string]string{
