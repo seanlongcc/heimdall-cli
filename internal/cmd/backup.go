@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 )
 
 // BackupRunner implements the backup command.
@@ -75,7 +78,7 @@ without a password retain configuration-only backups. Requires root privileges.`
 }
 
 // Run performs the backup.
-func (r *BackupRunner) Run(outputDir string) error {
+func (r *BackupRunner) Run(outputDir string) (err error) {
 	if r.CheckRoot != nil {
 		if err := r.CheckRoot(); err != nil {
 			return err
@@ -138,17 +141,6 @@ func (r *BackupRunner) Run(outputDir string) error {
 	}
 	ts := time.Now().Format("20060102-150405")
 	backupName := "heimdall-backup-" + ts
-	staging := filepath.Join(outputDir, "."+backupName)
-	backupDir := filepath.Join(staging, backupName)
-
-	if err := safeManagedPath(r.FS, filepath.Join(staging, ".heimdall-check")); err != nil {
-		return err
-	}
-	if _, err := r.FS.Lstat(staging); err == nil {
-		return fmt.Errorf("backup path already exists: %s", backupDir)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
 	archive := filepath.Join(outputDir, backupName+".tar.gz")
 	if err := safeManagedPath(r.FS, archive); err != nil {
 		return err
@@ -158,14 +150,37 @@ func (r *BackupRunner) Run(outputDir string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	if err := r.FS.MkdirAll(outputDir, 0700); err != nil {
+	// Keep all path-consuming copies, pg_dump and tar below trusted ancestry.
+	// A 0700 child under the app-owned output directory does not protect its name.
+	output, err := openBackupOutput(outputDir, true)
+	if err != nil {
+		return fmt.Errorf("opening backup output: %w", err)
+	}
+	defer output.Close()
+	staging, err := backupWorkspace()
+	if err != nil {
 		return err
 	}
-	// Exclusive creation avoids trusting a predictable directory in /tmp.
-	if err := runChecked(r.Exec, "mkdir", "-m", "0700", staging); err != nil {
-		return err
-	}
-	defer r.FS.RemoveAll(staging)
+	keepArchive, archiveReady := false, false
+	temporaryArchive := ""
+	defer func() {
+		if cleanupErr := r.FS.RemoveAll(staging); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("cleaning backup workspace %s: %w", staging, cleanupErr))
+			keepArchive = archiveReady
+		}
+		if !keepArchive && temporaryArchive != "" {
+			if cleanupErr := os.Remove(temporaryArchive); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("cleaning private archive %s: %w", temporaryArchive, cleanupErr))
+				keepArchive = archiveReady
+			}
+		}
+		if err == nil {
+			fmt.Fprintf(r.Out, "\nBackup saved to: %s\n", archive)
+		} else if keepArchive {
+			err = fmt.Errorf("%w; completed private archive retained at %s", err, temporaryArchive)
+		}
+	}()
+	backupDir := filepath.Join(staging, backupName)
 	if err := r.FS.MkdirAll(backupDir, 0700); err != nil {
 		return fmt.Errorf("failed to create backup directory: %w", err)
 	}
@@ -256,9 +271,14 @@ func (r *BackupRunner) Run(outputDir string) error {
 		fmt.Fprintln(r.Out, "Database: skipped (no password configured)")
 	}
 
-	// Publish only a completed private archive, using an atomic same-filesystem rename.
-	temporaryArchive := filepath.Join(staging, "archive.tar.gz")
-	if err := r.FS.WriteFile(temporaryArchive, nil, 0600); err != nil {
+	// Keep the archive separate so a partial workspace cleanup cannot destroy
+	// completed recovery evidence. The validated temp parent protects its name.
+	archiveFile, err := os.CreateTemp(filepath.Dir(staging), ".heimdall-backup-*.tar.gz")
+	if err != nil {
+		return err
+	}
+	temporaryArchive = archiveFile.Name()
+	if err := archiveFile.Close(); err != nil {
 		return err
 	}
 	if err := runChecked(r.Exec, "chmod", "0600", temporaryArchive); err != nil {
@@ -270,11 +290,22 @@ func (r *BackupRunner) Run(outputDir string) error {
 		return fmt.Errorf("failed to create archive")
 	}
 
-	if err := r.FS.Rename(temporaryArchive, archive); err != nil {
+	keepArchive, archiveReady = true, true
+	if err := backupOutputUnchanged(outputDir, output); err != nil {
+		return err
+	}
+	input, err := os.Open(temporaryArchive)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	if err := publishBackupArchive(output, filepath.Base(archive), input); err != nil {
 		return fmt.Errorf("publishing backup archive: %w", err)
 	}
-	fmt.Fprintln(r.Out)
-	fmt.Fprintf(r.Out, "Backup saved to: %s\n", archive)
+	if err := backupOutputUnchanged(outputDir, output); err != nil {
+		return err
+	}
+	keepArchive = false
 	return nil
 }
 
@@ -314,6 +345,173 @@ func walkRecoveryTree(fs FileSystem, root string, visit func(string, os.FileInfo
 		if err := walkRecoveryTree(fs, filepath.Join(root, entry.Name()), visit); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// These paths are used by subprocesses, so every ancestor must prevent another
+// account from renaming our private workspace. Sticky temp directories are safe
+// when their owner is trusted, just like root's own 0700 directories.
+func backupWorkspace() (string, error) {
+	parent, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		return "", err
+	}
+	for path := parent; ; path = filepath.Dir(path) {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return "", err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !info.IsDir() || !ok || (stat.Uid != 0 && stat.Uid != uint32(os.Geteuid())) ||
+			(info.Mode().Perm()&0022 != 0 && info.Mode()&os.ModeSticky == 0) {
+			return "", fmt.Errorf("backup temporary directory has unprotected ancestry: %s", path)
+		}
+		if path == filepath.Dir(path) {
+			break
+		}
+	}
+	return os.MkdirTemp(parent, ".heimdall-backup-")
+}
+
+// Open each component without following links. Held descriptors continue to
+// identify the intended directory if its app-owned name or an ancestor moves.
+func openBackupOutput(path string, create bool) (*os.File, error) {
+	dir, err := os.Open(string(os.PathSeparator))
+	if err != nil {
+		return nil, err
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(filepath.Clean(path), "/"), "/") {
+		if component == "" {
+			continue
+		}
+		fd, err := unix.Openat(int(dir.Fd()), component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if errors.Is(err, unix.ENOENT) && create {
+			if err = unix.Mkdirat(int(dir.Fd()), component, 0700); err == nil || errors.Is(err, unix.EEXIST) {
+				fd, err = unix.Openat(int(dir.Fd()), component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			}
+		}
+		dir.Close()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		dir = os.NewFile(uintptr(fd), component)
+	}
+	return dir, nil
+}
+
+func backupOutputUnchanged(path string, original *os.File) error {
+	current, err := openBackupOutput(path, false)
+	if err != nil {
+		return fmt.Errorf("backup output changed: %w", err)
+	}
+	defer current.Close()
+	before, err := original.Stat()
+	if err != nil {
+		return err
+	}
+	after, err := current.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(before, after) {
+		return fmt.Errorf("backup output directory changed: %s", path)
+	}
+	return nil
+}
+
+// Copy to the output filesystem through a private directory descriptor, then
+// atomically link the finished inode into place without overwriting any entry.
+// os.Root cannot link between two independently held roots; linkat can.
+func publishBackupArchive(output *os.File, name string, input io.Reader) (err error) {
+	parentFD := int(output.Fd())
+	container := ".heimdall-publish-" + rand.Text()
+	if err := unix.Mkdirat(parentFD, container, 0700); err != nil {
+		return err
+	}
+	fd, err := unix.Openat(parentFD, container, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("opening private publication directory %s (retained): %w", container, err)
+	}
+	dir := os.NewFile(uintptr(fd), container)
+	defer dir.Close()
+	info, err := dir.Stat()
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) || info.Mode().Perm() != 0700 {
+		return fmt.Errorf("private publication directory changed: %s (retained)", container)
+	}
+	defer func() {
+		if cleanupErr := removeBackupPublication(output, dir, container); cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+		}
+	}()
+	fileFD, err := unix.Openat(fd, "archive", unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fileFD), "archive")
+	defer func() {
+		if cleanupErr := unix.Unlinkat(fd, "archive", 0); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("cleaning private publication file in %s: %w", container, cleanupErr))
+		}
+	}()
+	// Metadata is applied to the new inode, never to an app-controlled pathname.
+	copyErr := file.Chmod(0600)
+	if copyErr == nil {
+		_, copyErr = io.Copy(file, input)
+	}
+	if copyErr == nil {
+		copyErr = file.Sync()
+	}
+	written, statErr := file.Stat()
+	closeErr := file.Close()
+	if err := errors.Join(copyErr, statErr, closeErr); err != nil {
+		return err
+	}
+	if err := unix.Linkat(fd, "archive", parentFD, name, 0); err != nil {
+		return err
+	}
+	publishedFD, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("published archive changed: %w", err)
+	}
+	published := os.NewFile(uintptr(publishedFD), name)
+	defer published.Close()
+	info, err = published.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(written, info) {
+		return fmt.Errorf("published archive entry changed: %s", name)
+	}
+	return nil
+}
+
+func removeBackupPublication(output, dir *os.File, name string) error {
+	fd, err := unix.Openat(int(output.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("publication directory changed; entry %s retained: %w", name, err)
+	}
+	current := os.NewFile(uintptr(fd), name)
+	defer current.Close()
+	before, err := dir.Stat()
+	if err != nil {
+		return err
+	}
+	after, err := current.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(before, after) {
+		return fmt.Errorf("publication directory changed; entry %s retained", name)
+	}
+	// A final name race can only remove an empty directory in this held output
+	// namespace. AT_REMOVEDIR cannot follow links or delete replacement contents.
+	if err := unix.Unlinkat(int(output.Fd()), name, unix.AT_REMOVEDIR); err != nil {
+		return fmt.Errorf("cleaning publication directory %s: %w", name, err)
 	}
 	return nil
 }

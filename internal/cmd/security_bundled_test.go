@@ -280,17 +280,14 @@ type trustOrderExec struct {
 	*FakeExecRunner
 	t    *testing.T
 	psql string
+	fs   FileSystem
 }
 
 func (e *trustOrderExec) RunWithEnv(env map[string]string, name string, args ...string) (string, int, error) {
 	if name == e.psql {
-		trusted := false
-		for _, c := range e.Calls {
-			if c.Name == "fapolicyd-cli" && contains(c.Args, e.psql) {
-				trusted = true
-			}
-		}
-		require.True(e.t, trusted, "trust must precede the external-database private client preflight")
+		trusted, err := e.fs.ReadFile("/etc/fapolicyd/trust.d/" + fapolicydTrustFile)
+		require.NoError(e.t, err)
+		require.Contains(e.t, string(trusted), e.psql+" ", "trust must precede the external-database private client preflight")
 	}
 	return e.FakeExecRunner.RunWithEnv(env, name, args...)
 }
@@ -300,7 +297,7 @@ func TestBundledExternalPreflightTrustsPrivateClientFirst(t *testing.T) {
 	r.DBHost = "db.example.test"
 	r.DBPort = 5432
 	r.flagChanged = map[string]bool{"db-host": true, "db-port": true}
-	r.Exec = &trustOrderExec{r.Exec.(*FakeExecRunner), t, r.Paths.RuntimePath("postgresql", "bin", "psql")}
+	r.Exec = &trustOrderExec{r.Exec.(*FakeExecRunner), t, r.Paths.RuntimePath("postgresql", "bin", "psql"), r.FS}
 	require.NoError(t, r.Run())
 }
 
@@ -594,14 +591,8 @@ func TestSecurityRound1PrivateAliasInventory(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			trusted := false
-			for _, c := range ex.Calls {
-				if c.Name == "fapolicyd-cli" {
-					require.NotContains(t, c.Args, alias)
-					trusted = trusted || contains(c.Args, target)
-				}
-			}
-			require.True(t, trusted)
+			require.NotContains(t, string(fs.Files[trust]), alias+" ")
+			require.Contains(t, string(fs.Files[trust]), target+" ")
 		})
 	}
 }

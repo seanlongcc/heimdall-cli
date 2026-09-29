@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -203,24 +204,18 @@ func TestRestoreCmd_ViaCobra_MissingFile(t *testing.T) {
 }
 
 func TestBackupCmd_ViaCobra(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/etc/heimdall-server/backend.env"] = []byte("PORT=3000\n")
+	paths, fs, exec := recoveryFixture(t, false)
 	r := &BackupRunner{
-		Env: &FakeEnvManager{
-			Env:  map[string]string{"DATABASE_PASSWORD": "pass"},
-			Path: "/etc/heimdall-server/backend.env",
-		},
-		Exec: &FakeExecRunner{Results: map[string]FakeExecResult{
-			"pg_dump -h": {ExitCode: 0},
-			"tar czf":    {ExitCode: 0},
-		}},
+		Paths:     paths,
+		Env:       &FileEnvManager{Path: paths.EnvFile},
+		Exec:      exec,
 		FS:        fs,
 		CheckRoot: func() error { return nil },
 	}
 	cmd := NewBackupCmd(r)
 	out := new(bytes.Buffer)
 	cmd.SetOut(out)
-	cmd.SetArgs([]string{"-o", "/tmp"})
+	cmd.SetArgs([]string{"-o", filepath.Dir(paths.ConfigDir)})
 	err := cmd.Execute()
 	require.NoError(t, err)
 	assert.Contains(t, out.String(), "Backup saved to:")

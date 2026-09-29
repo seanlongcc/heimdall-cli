@@ -7,6 +7,8 @@ package cmd
 // per platform later (see saf-packaging-alk).
 
 import (
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,7 +20,7 @@ import (
 )
 
 // fapolicydTrustFile is the name of the trust list under /etc/fapolicyd/trust.d/.
-// fapolicyd-cli writes to this file when called with --trust-file.
+// It uses the native fapolicyd.trust(5) PATH SIZE SHA256 format.
 const fapolicydTrustFile = "heimdall-server"
 
 // fapolicydAppDir contains application native .node addons.
@@ -105,6 +107,9 @@ func (r *FapolicydRunner) Add() error {
 	}
 	validated := make(map[string]bool, len(files))
 	for _, path := range files {
+		if strings.IndexFunc(path, func(c rune) bool { return c < 0x20 || c == 0x7f }) >= 0 {
+			return fmt.Errorf("control character in fapolicyd trust path: %q", path)
+		}
 		if err := requireRegular(r.FS, path); err != nil {
 			return err
 		}
@@ -119,6 +124,20 @@ func (r *FapolicydRunner) Add() error {
 			return fmt.Errorf("private runtime alias %s targets an unlisted immutable file: %s", alias, target)
 		}
 	}
+	// Native --file add deduplicates across all trust files, including the
+	// previous owned snapshot. Build actual hashes before publishing instead.
+	var records strings.Builder
+	for _, path := range files {
+		data, err := r.FS.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("hashing fapolicyd trust path %s: %w", path, err)
+		}
+		fmt.Fprintf(&records, "%s %d %x\n", path, len(data), sha256.Sum256(data))
+	}
+	previous, err := snapshotFile(r.FS, trustPath)
+	if err != nil {
+		return err
+	}
 	if err := r.FS.MkdirAll("/etc/fapolicyd/trust.d", 0755); err != nil {
 		return err
 	}
@@ -126,27 +145,38 @@ func (r *FapolicydRunner) Add() error {
 		return err
 	}
 	defer r.FS.RemoveAll(pending)
-	if err := r.FS.WriteFile(pending, nil, 0600); err != nil {
-		return err
-	}
-	if err := runChecked(r.Exec, "chown", "root:root", pending); err != nil {
-		return err
-	}
-	for _, path := range files {
-		if err := runChecked(r.Exec, "fapolicyd-cli", "--file", "add", path, "--trust-file", fapolicydTrustFile+".pending"); err != nil {
-			return err
-		}
-	}
-	if err := r.FS.Rename(pending, trustPath); err != nil {
+	if err := r.publishTrustSnapshot(pending, trustPath, []byte(records.String())); err != nil {
 		return err
 	}
 	if err := r.reloadIfActive(); err != nil {
-		return err
+		var rollback error
+		if previous.exists {
+			rollback = r.publishTrustSnapshot(pending, trustPath, previous.data)
+		} else {
+			rollback = r.FS.RemoveAll(trustPath)
+		}
+		if rollback == nil {
+			rollback = r.reloadIfActive()
+		}
+		return errors.Join(err, rollback)
 	}
 	if r.Out != nil {
 		fmt.Fprintln(r.Out, "fapolicyd: trust entries added (hashes refreshed)")
 	}
 	return nil
+}
+
+func (r *FapolicydRunner) publishTrustSnapshot(pending, trustPath string, records []byte) error {
+	if err := r.FS.WriteFile(pending, records, 0600); err != nil {
+		return err
+	}
+	if err := runChecked(r.Exec, "chown", "root:root", pending); err != nil {
+		return err
+	}
+	if err := runChecked(r.Exec, "chmod", "0600", pending); err != nil {
+		return err
+	}
+	return r.FS.Rename(pending, trustPath)
 }
 
 // Remove touches only the Heimdall trust file, preserving administrator lists.
