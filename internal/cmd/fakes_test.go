@@ -99,6 +99,12 @@ func (f *FakeExecRunner) Verify(t testing.TB) {
 
 func (f *FakeExecRunner) RunWithEnv(env map[string]string, name string, args ...string) (string, int, error) {
 	f.Calls = append(f.Calls, FakeExecCall{Name: name, Args: args, Env: env})
+	fullKey := strings.Join(append([]string{name}, args...), " ")
+	if r, ok := f.Results[fullKey]; ok {
+		r.matched = true
+		f.Results[fullKey] = r
+		return r.Stdout, r.ExitCode, r.Err
+	}
 	key := execKey(name, args)
 	if r, ok := f.Results[key]; ok {
 		r.matched = true
@@ -446,7 +452,8 @@ func (f *FakeDBConnector) TableCount(host string, port int, user, password, dbNa
 	return f.Tables, f.TableErr
 }
 
-func (f *FakeFileSystem) Lstat(path string) (os.FileInfo, error) { return f.Stat(path) }
+func (f *FakeFileSystem) EvalSymlinks(path string) (string, error) { return path, nil }
+func (f *FakeFileSystem) Lstat(path string) (os.FileInfo, error)   { return f.Stat(path) }
 func (f *FakeFileSystem) ReadDir(path string) ([]os.DirEntry, error) {
 	var entries []os.DirEntry
 	for name := range f.Files {

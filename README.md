@@ -97,14 +97,17 @@ sudo heimdall-cli setup --non-interactive
 Full setup uses saved selections, starts the selected database, applies
 migrations, clears `/etc/heimdall-server/upgrade-pending`, and starts the selected
 services. Failed migrations, `--skip-db`, and `--reconfigure` retain the marker
-and leave the application stopped. PostgreSQL major upgrades require a separate
+and leave the application stopped. Failed application activation stops the app
+and restores an upgrade marker if setup removed one. PostgreSQL major upgrades require a separate
 planned migration. RPM uninstall retains application/database state, CA keys,
 certificates, and service accounts; normal RPM `.rpmsave` rules apply to config.
 
 `heimdall-cli backup` creates a private mode-0600 archive containing a logical
 SQL dump and configuration, plus optional `caddy-config/` and `caddy-state/`
 entries for owned Caddy configuration and CA/certificate state. It never archives
-live PostgreSQL data files. Restore validates the archive before writes, accepts
+live PostgreSQL data files. RPM database backups require resolved connection
+credentials, including a password from `DATABASE_PASSWORD` or `DATABASE_URL`.
+Restore validates the archive before writes, accepts
 older archives without Caddy entries, preserves dedicated ownership, and requires
 successful setup/migrations before application startup. Restore overwrites the
 selected configuration/database; retain a verified backup before recovery.
@@ -113,7 +116,9 @@ SELinux relabeling and fapolicyd trust refresh run before private service
 activation. Trust covers immutable private executables/libraries and application
 native addons, not mutable state. Only newly added TCP labels are recorded in
 root-owned mode-0600 `/etc/heimdall-server/selinux-ports`; compatible preexisting
-labels stay unowned. Removal affects only owned trust and port records. The
+labels stay unowned. Failed ledger updates retain successful additions in
+`selinux-ports.pending`; setup reconciles exact matching local labels on retry,
+and RPM removal checks both ledgers. Removal affects only owned trust and port records. The
 policy uses the existing Heimdall domain and stock PostgreSQL/HTTP domains.
 Actual enforcing-host support must be validated on the deployment platform;
 stock bundled runtimes do not establish FIPS validation.

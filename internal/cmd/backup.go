@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -44,7 +45,7 @@ backend.env configuration file. Private Caddy configuration and certificate/CA
 state are included when present. These are packaged into a private (0600), timestamped
 tar.gz archive named heimdall-backup-YYYYMMDD-HHMMSS.tar.gz.
 
-The database backup requires DATABASE_PASSWORD to be set in backend.env.
+The database backup requires a password in DATABASE_PASSWORD or DATABASE_URL.
 RPM installations require a successful database dump and PostgreSQL 13–18.
 A newer server requires an RPM with compatible clients. Standalone installations
 without a password retain configuration-only backups. Requires root privileges.`,
@@ -89,13 +90,12 @@ func (r *BackupRunner) Run(outputDir string) error {
 	if err != nil {
 		return err
 	}
-	if rpm && env["DATABASE_PASSWORD"] == "" {
-		return fmt.Errorf("RPM backup requires DATABASE_PASSWORD and a successful database dump; run setup before backing up")
-	}
-
 	dbCfg, err := resolveDBConfig(env)
 	if err != nil {
 		return err
+	}
+	if rpm && dbCfg.Password == "" {
+		return fmt.Errorf("RPM backup requires a database password and a successful database dump; run setup before backing up")
 	}
 	binary, err := postgresClient(r.Paths, r.FS, "pg_dump")
 	if err != nil {
@@ -179,6 +179,15 @@ func (r *BackupRunner) Run(outputDir string) error {
 		return err
 	}
 	for name, source := range trees {
+		canonical, err := r.FS.EvalSymlinks(source)
+		if err != nil {
+			return err
+		}
+		root, err := os.OpenRoot(canonical)
+		if err != nil {
+			return err
+		}
+		defer root.Close()
 		if err := walkRecoveryTree(r.FS, source, func(path string, info os.FileInfo) error {
 			rel, err := filepath.Rel(source, path)
 			if err != nil {
@@ -188,12 +197,38 @@ func (r *BackupRunner) Run(outputDir string) error {
 			if info.IsDir() {
 				return r.FS.MkdirAll(dest, 0700)
 			}
-			if err := r.FS.CopyFile(path, dest); err != nil {
+			// The descriptor stays beneath the owned source even if Caddy swaps
+			// a descendant after preflight. Never copy an outside hard-link inode.
+			input, err := root.Open(rel)
+			if err != nil {
 				return err
+			}
+			defer input.Close()
+			opened, err := input.Stat()
+			if err != nil {
+				return err
+			}
+			if !opened.Mode().IsRegular() {
+				return fmt.Errorf("unexpected backup source: %s", path)
+			}
+			if stat, ok := opened.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
+				return fmt.Errorf("hard-linked backup source: %s", path)
+			}
+			output, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(output, input)
+			closeErr := output.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
 			}
 			mode := os.FileMode(0600)
 			if name == "caddy-config" {
-				mode = info.Mode().Perm() & 0640
+				mode = opened.Mode().Perm() & 0640
 			}
 			return runChecked(r.Exec, "chmod", fmt.Sprintf("%04o", mode), dest)
 		}); err != nil {

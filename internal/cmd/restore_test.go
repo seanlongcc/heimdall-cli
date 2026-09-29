@@ -31,12 +31,16 @@ type recoveryFS struct {
 }
 
 func (f *recoveryFS) path(p string) string {
+	if strings.HasPrefix(p, "/var/lib/.heimdall-restore.") {
+		return filepath.Dir(f.state) + strings.TrimPrefix(p, "/var/lib")
+	}
 	if p == "/var/lib/heimdall-caddy" || strings.HasPrefix(p, "/var/lib/heimdall-caddy/") {
 		return f.state + strings.TrimPrefix(p, "/var/lib/heimdall-caddy")
 	}
 	return p
 }
-func (f *recoveryFS) ReadFile(p string) ([]byte, error) { return os.ReadFile(f.path(p)) }
+func (f *recoveryFS) EvalSymlinks(p string) (string, error) { return filepath.EvalSymlinks(f.path(p)) }
+func (f *recoveryFS) ReadFile(p string) ([]byte, error)     { return os.ReadFile(f.path(p)) }
 func (f *recoveryFS) WriteFile(p string, b []byte, m os.FileMode) error {
 	return os.WriteFile(f.path(p), b, m)
 }
@@ -52,7 +56,9 @@ func (f *recoveryFS) MkdirAll(p string, m os.FileMode) error  { return os.MkdirA
 func (f *recoveryFS) CopyFile(a, b string) error {
 	return f.osFileSystem.CopyFile(f.path(a), f.path(b))
 }
-func (f *recoveryFS) Exists(p string) bool { _, e := f.Stat(p); return e == nil }
+func (f *recoveryFS) Rename(a, b string) error { return os.Rename(f.path(a), f.path(b)) }
+func (f *recoveryFS) RemoveAll(p string) error { return os.RemoveAll(f.path(p)) }
+func (f *recoveryFS) Exists(p string) bool     { _, e := f.Stat(p); return e == nil }
 
 type recoveryExec struct {
 	fs      *recoveryFS
@@ -69,6 +75,13 @@ func (e *recoveryExec) Run(name string, args ...string) (string, int, error) {
 		return "fixture failure", 1, nil
 	}
 	switch name {
+	case "mktemp":
+		template := args[1]
+		path, err := os.MkdirTemp(filepath.Dir(e.fs.path(template)), filepath.Base(template))
+		if err != nil {
+			return "", 1, err
+		}
+		return filepath.Join(filepath.Dir(template), filepath.Base(path)), 0, nil
 	case "mkdir":
 		return "", 0, os.Mkdir(args[2], 0700)
 	case "tar":
@@ -408,4 +421,162 @@ func TestRestoreSecuresExistingEnvBeforeCopy(t *testing.T) {
 	r := recoveryRestore(p, fs, e)
 	r.FS = &privateRecoveryCopyFS{recoveryFS: fs, env: p.EnvFile}
 	require.NoError(t, r.Run(oldRecoveryArchive(t, "JWT_SECRET=restored\n", false)))
+}
+
+type recoverySwapOnStop struct {
+	*recoveryExec
+	swap    func() error
+	swapped bool
+}
+
+func (e *recoverySwapOnStop) Run(name string, args ...string) (string, int, error) {
+	if !e.swapped && name == "systemctl" && len(args) == 2 && args[0] == "stop" && args[1] == bundledCaddyService {
+		if err := e.swap(); err != nil {
+			return "", 1, err
+		}
+		e.swapped = true
+	}
+	return e.recoveryExec.Run(name, args...)
+}
+
+func TestRestoreConfinesPublicationAfterPreflight(t *testing.T) {
+	for _, kind := range []string{"leaf symlink", "leaf hardlink", "ancestor symlink", "root symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, true)
+			require.NoError(t, os.MkdirAll(fs.state+"/data", 0700))
+			require.NoError(t, os.WriteFile(fs.state+"/data/key", []byte("old state"), 0600))
+			outsideDir := filepath.Join(filepath.Dir(p.ConfigDir), "outside")
+			require.NoError(t, os.MkdirAll(outsideDir+"/data", 0700))
+			for _, file := range []string{outsideDir + "/key", outsideDir + "/data/key"} {
+				require.NoError(t, os.WriteFile(file, []byte("untouched"), 0644))
+				require.NoError(t, os.Chmod(file, 0644))
+			}
+			archive := recoveryArchive(t, []*tar.Header{{Name: "backup/backend.env", Mode: 0640, Typeflag: tar.TypeReg}, {Name: "backup/caddy-state/data/key", Mode: 0600, Typeflag: tar.TypeReg}}, []string{"DATABASE_PASSWORD=old\nHEIMDALL_PROXY_MODE=bundled\n", "restored private key"})
+			r := recoveryRestore(p, fs, e)
+			swap := &recoverySwapOnStop{recoveryExec: e, swap: func() error {
+				target := fs.state + "/data/key"
+				outside := outsideDir + "/key"
+				if kind == "ancestor symlink" {
+					target = fs.state + "/data"
+					outside = outsideDir
+				}
+				if kind == "root symlink" {
+					target = fs.state
+					outside = outsideDir
+				}
+				if err := os.Rename(target, target+".before-swap"); err != nil {
+					return err
+				}
+				if kind == "leaf hardlink" {
+					return os.Link(outside, target)
+				}
+				return os.Symlink(outside, target)
+			}}
+			r.Exec = swap
+			require.NoError(t, r.Run(archive))
+			require.True(t, swap.swapped)
+			for _, file := range []string{outsideDir + "/key", outsideDir + "/data/key"} {
+				data, err := os.ReadFile(file)
+				require.NoError(t, err)
+				require.Equal(t, "untouched", string(data))
+				info, err := os.Stat(file)
+				require.NoError(t, err)
+				require.Equal(t, os.FileMode(0644), info.Mode().Perm())
+			}
+			data, err := os.ReadFile(fs.state + "/data/key")
+			require.NoError(t, err)
+			require.Equal(t, "restored private key", string(data))
+			require.FileExists(t, p.ConfigDir+"/upgrade-pending")
+		})
+	}
+}
+
+type recoveryPublicationFailureFS struct {
+	*recoveryFS
+	failure string
+}
+
+func (f *recoveryPublicationFailureFS) Rename(src, dest string) error {
+	if (f.failure == "publish" || f.failure == "rollback") && strings.HasSuffix(src, "/restored") {
+		return fmt.Errorf("injected publication failure")
+	}
+	if f.failure == "rollback" && strings.HasSuffix(src, "/previous") {
+		return fmt.Errorf("injected rollback failure")
+	}
+	return f.recoveryFS.Rename(src, dest)
+}
+func (f *recoveryPublicationFailureFS) RemoveAll(path string) error {
+	if f.failure == "cleanup" && strings.HasSuffix(path, "/previous") {
+		return fmt.Errorf("injected prior-tree cleanup failure")
+	}
+	return f.recoveryFS.RemoveAll(path)
+}
+func TestRestorePublicationFailuresRetainRecoveryState(t *testing.T) {
+	for _, failure := range []string{"publish", "rollback", "cleanup"} {
+		t.Run(failure, func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, true)
+			require.NoError(t, os.MkdirAll(fs.state+"/data", 0700))
+			require.NoError(t, os.WriteFile(fs.state+"/data/key", []byte("prior CA key"), 0600))
+			archive := recoveryArchive(t, []*tar.Header{{Name: "backup/backend.env", Mode: 0640, Typeflag: tar.TypeReg}, {Name: "backup/database.sql", Mode: 0600, Typeflag: tar.TypeReg}, {Name: "backup/caddy-state/data/key", Mode: 0600, Typeflag: tar.TypeReg}}, []string{"DATABASE_PASSWORD=old\nHEIMDALL_PROXY_MODE=bundled\n", "-- sql must not run", "restored CA key"})
+			r := recoveryRestore(p, fs, e)
+			r.FS = &recoveryPublicationFailureFS{recoveryFS: fs, failure: failure}
+			require.Error(t, r.Run(archive))
+			require.Empty(t, e.sql)
+			require.FileExists(t, p.ConfigDir+"/upgrade-pending")
+			require.Contains(t, r.ErrOut.(*bytes.Buffer).String(), "Restore staging retained for recovery:")
+			stages, err := filepath.Glob(filepath.Join(filepath.Dir(fs.state), ".heimdall-restore.*"))
+			require.NoError(t, err)
+			require.Len(t, stages, 1)
+			info, err := os.Stat(stages[0])
+			require.NoError(t, err)
+			require.Equal(t, os.FileMode(0700), info.Mode().Perm())
+			prior := stages[0] + "/previous/data/key"
+			if failure == "publish" {
+				prior = fs.state + "/data/key"
+			}
+			data, err := os.ReadFile(prior)
+			require.NoError(t, err)
+			require.Equal(t, "prior CA key", string(data))
+			for _, call := range e.calls {
+				if call.Name == "systemctl" {
+					require.Equal(t, "stop", call.Args[0])
+				}
+			}
+		})
+	}
+}
+
+func TestRestoreStagingRemainsRootOnlyUntilPublication(t *testing.T) {
+	p, fs, e := recoveryFixture(t, true)
+	archive := recoveryArchive(t, []*tar.Header{{Name: "backup/backend.env", Mode: 0640, Typeflag: tar.TypeReg}, {Name: "backup/caddy-state/data/key", Mode: 0600, Typeflag: tar.TypeReg}}, []string{"PORT=3000\n", "private CA key"})
+	r := recoveryRestore(p, fs, e)
+	guard := &recoveryStagingGuard{recoveryExec: e, t: t}
+	r.Exec = guard
+	require.NoError(t, r.Run(archive))
+	require.True(t, guard.checked)
+}
+
+type recoveryStagingGuard struct {
+	*recoveryExec
+	t       *testing.T
+	checked bool
+}
+
+func (e *recoveryStagingGuard) Run(name string, args ...string) (string, int, error) {
+	if name == "chown" && args[0] == "heimdall-caddy:heimdall-caddy" {
+		prefix, _, ok := strings.Cut(args[1], "/restored")
+		require.True(e.t, ok, "Caddy ownership must be assigned only inside unpublished staging")
+		info, err := os.Stat(e.fs.path(prefix))
+		require.NoError(e.t, err)
+		require.Equal(e.t, os.FileMode(0700), info.Mode().Perm())
+		var rootOwned bool
+		for _, call := range e.calls {
+			if call.Name == "chown" && len(call.Args) == 2 && call.Args[1] == prefix {
+				rootOwned = call.Args[0] == "root:root"
+			}
+		}
+		require.True(e.t, rootOwned, "the staging container must retain root ownership")
+		e.checked = true
+	}
+	return e.recoveryExec.Run(name, args...)
 }

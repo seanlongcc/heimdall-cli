@@ -108,6 +108,7 @@ func (r *osFileSystem) ReadFile(path string) ([]byte, error) { return os.ReadFil
 func (r *osFileSystem) WriteFile(path string, data []byte, perm os.FileMode) error {
 	return os.WriteFile(path, data, perm)
 }
+func (r *osFileSystem) EvalSymlinks(path string) (string, error)   { return filepath.EvalSymlinks(path) }
 func (r *osFileSystem) Lstat(path string) (os.FileInfo, error)     { return os.Lstat(path) }
 func (r *osFileSystem) ReadDir(path string) ([]os.DirEntry, error) { return os.ReadDir(path) }
 func (r *osFileSystem) Rename(old, new string) error               { return os.Rename(old, new) }

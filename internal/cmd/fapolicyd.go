@@ -51,7 +51,7 @@ func (r *FapolicydRunner) Add() error {
 		}
 		return nil
 	}
-	var files []string
+	var files, aliases []string
 	for _, root := range []string{
 		"/usr/libexec/heimdall-server/runtime/node/bin",
 		"/usr/libexec/heimdall-server/runtime/postgresql/bin",
@@ -70,8 +70,8 @@ func (r *FapolicydRunner) Add() error {
 			if err != nil {
 				return err
 			}
-			// libpq.so aliases resolve to the versioned regular file in this inventory.
 			if info.Mode()&os.ModeSymlink != 0 {
+				aliases = append(aliases, path)
 				continue
 			}
 			if strings.HasSuffix(root, "/lib") && !strings.Contains(filepath.Base(path), ".so") {
@@ -95,7 +95,7 @@ func (r *FapolicydRunner) Add() error {
 	sort.Strings(files)
 	trustPath := "/etc/fapolicyd/trust.d/" + fapolicydTrustFile
 	pending := trustPath + ".pending"
-	if len(files) == 0 && !r.FS.Exists(trustPath) {
+	if len(files) == 0 && len(aliases) == 0 && !r.FS.Exists(trustPath) {
 		return r.reloadIfActive()
 	}
 	for _, path := range []string{trustPath, pending} {
@@ -103,9 +103,20 @@ func (r *FapolicydRunner) Add() error {
 			return err
 		}
 	}
+	validated := make(map[string]bool, len(files))
 	for _, path := range files {
 		if err := requireRegular(r.FS, path); err != nil {
 			return err
+		}
+		validated[path] = true
+	}
+	for _, alias := range aliases {
+		target, err := r.FS.EvalSymlinks(alias)
+		if err != nil {
+			return fmt.Errorf("resolving private runtime alias %s: %w", alias, err)
+		}
+		if !validated[target] {
+			return fmt.Errorf("private runtime alias %s targets an unlisted immutable file: %s", alias, target)
 		}
 	}
 	if err := r.FS.MkdirAll("/etc/fapolicyd/trust.d", 0755); err != nil {

@@ -1883,6 +1883,11 @@ func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 	if err := rootManagedFile(r.FS, marker); err != nil {
 		return err
 	}
+	originalMarker, err := snapshotFile(r.FS, marker)
+	if err != nil {
+		return err
+	}
+	markerRemoved := false
 	selectedPorts, err := r.selectedSELinuxPorts(env)
 	if err != nil {
 		return err
@@ -2000,12 +2005,31 @@ func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 		unit            string
 		active, enabled bool
 	}
-	wrote, dependencyChanged := false, false
+	wrote, dependencyChanged, startAttempted := false, false, false
 	defer func() {
 		if err == nil {
 			return
 		}
 		var rollback []error
+		if markerRemoved {
+			markerErr := func() error {
+				if err := rootManagedFile(r.FS, marker); err != nil {
+					return err
+				}
+				if err := r.FS.WriteFile(marker, originalMarker.data, 0600); err != nil {
+					return err
+				}
+				if err := runChecked(r.Exec, "chown", "root:root", marker); err != nil {
+					return err
+				}
+				return runChecked(r.Exec, "chmod", "0600", marker)
+			}()
+			rollback = append(rollback, markerErr)
+		}
+		// Stop any partially started app before restoring prior configuration.
+		if startAttempted {
+			rollback = append(rollback, r.Systemd.Stop(ServiceName))
+		}
 		if proxy != nil {
 			rollback = append(rollback, proxy.rollback())
 		}
@@ -2155,7 +2179,9 @@ func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 		if err := r.FS.RemoveAll(marker); err != nil {
 			return err
 		}
+		markerRemoved = true
 	}
+	startAttempted = true
 	if err := r.stepStartService(); err != nil {
 		return err
 	}

@@ -37,6 +37,7 @@ type FileSystem interface {
 	WriteFile(path string, data []byte, perm os.FileMode) error
 	Stat(path string) (os.FileInfo, error)
 	Lstat(path string) (os.FileInfo, error)
+	EvalSymlinks(path string) (string, error)
 	ReadDir(path string) ([]os.DirEntry, error)
 	Rename(old, new string) error
 	CopyFile(src, dst string) error

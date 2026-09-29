@@ -400,3 +400,84 @@ func TestBackupCommandFailuresDoNotClaimSuccess(t *testing.T) {
 		})
 	}
 }
+
+func TestBackupRPMAcceptsResolvedURLCredentials(t *testing.T) {
+	p, fs, e := recoveryFixture(t, true)
+	require.NoError(t, os.WriteFile(p.EnvFile, []byte("DATABASE_URL=postgres://backup:secret@db.example.test:5432/heimdall\nHEIMDALL_DATABASE_MODE=external\n"), 0600))
+	r := &BackupRunner{Paths: p, FS: fs, Exec: e, Env: &FileEnvManager{Path: p.EnvFile}, Out: new(bytes.Buffer), ErrOut: new(bytes.Buffer)}
+	require.NoError(t, r.Run(filepath.Join(filepath.Dir(p.ConfigDir), "url-backups")))
+	var dumped bool
+	for _, call := range e.calls {
+		if filepath.Base(call.Name) == "pg_dump" {
+			dumped = true
+			require.Equal(t, "secret", call.Env["PGPASSWORD"])
+			require.Contains(t, call.Args, "db.example.test")
+			require.Contains(t, call.Args, "backup")
+			require.Contains(t, call.Args, "heimdall")
+		}
+	}
+	require.True(t, dumped, "URL-only credentials must produce the required SQL dump")
+}
+
+type backupSwapAfterCheckFS struct {
+	*recoveryFS
+	target  string
+	reads   int
+	swapped bool
+	swap    func() error
+}
+
+func (f *backupSwapAfterCheckFS) Lstat(path string) (os.FileInfo, error) {
+	info, err := f.recoveryFS.Lstat(path)
+	if err != nil {
+		return info, err
+	}
+	if path == f.target {
+		f.reads++
+	}
+	// The fourth leaf stat is the copy walk's guard, after the initial preflight.
+	// Swap only after the last ancestor check returns its original metadata.
+	if f.reads == 4 && !f.swapped && path == "/var" {
+		if err := f.swap(); err != nil {
+			return nil, err
+		}
+		f.swapped = true
+	}
+	return info, nil
+}
+func TestBackupConfinesSourceReadAfterPreflight(t *testing.T) {
+	for _, kind := range []string{"leaf symlink", "ancestor symlink", "hardlink"} {
+		t.Run(kind, func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, true)
+			require.NoError(t, os.MkdirAll(fs.state+"/data", 0700))
+			target := fs.state + "/data/key"
+			require.NoError(t, os.WriteFile(target, []byte("owned state"), 0600))
+			outside := filepath.Join(filepath.Dir(fs.state), "outside")
+			require.NoError(t, os.Mkdir(outside, 0700))
+			require.NoError(t, os.WriteFile(outside+"/key", []byte("outside data must never be archived"), 0600))
+			racing := &backupSwapAfterCheckFS{recoveryFS: fs, target: "/var/lib/heimdall-caddy/data/key", swap: func() error {
+				leaf := target
+				link := outside + "/key"
+				if kind == "ancestor symlink" {
+					leaf = fs.state + "/data"
+					link = outside
+				}
+				if err := os.Rename(leaf, leaf+".prior"); err != nil {
+					return err
+				}
+				if kind == "hardlink" {
+					return os.Link(link, leaf)
+				}
+				return os.Symlink(link, leaf)
+			}}
+			out := new(bytes.Buffer)
+			r := &BackupRunner{Paths: p, FS: racing, Exec: e, Env: &FileEnvManager{Path: p.EnvFile}, Out: out, ErrOut: out}
+			require.Error(t, r.Run(filepath.Dir(p.ConfigDir)))
+			require.True(t, racing.swapped)
+			archives, err := filepath.Glob(filepath.Join(filepath.Dir(p.ConfigDir), "*.tar.gz"))
+			require.NoError(t, err)
+			require.Empty(t, archives)
+			require.NotContains(t, out.String(), "Backup saved")
+		})
+	}
+}

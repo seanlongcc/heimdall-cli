@@ -71,6 +71,10 @@ func validSELinuxPort(p selinuxPort) bool {
 // Native semanage output contains comma lists and inclusive ranges. Broad
 // unreserved defaults do not reserve a port for another service.
 func selinuxPortCompatible(output string, wanted selinuxPort) (bool, error) {
+	return matchSELinuxPort(output, wanted, false)
+}
+
+func matchSELinuxPort(output string, wanted selinuxPort, exactLocal bool) (bool, error) {
 	compatible := false
 	for _, line := range strings.Split(output, "\n") {
 		f := strings.Fields(line)
@@ -95,7 +99,16 @@ func selinuxPortCompatible(output string, wanted selinuxPort) (bool, error) {
 				return false, fmt.Errorf("invalid SELinux port range: %q", span)
 			}
 			port, _ := strconv.Atoi(wanted.port)
-			if port < start || port > end || f[0] == "unreserved_port_t" || f[0] == "reserved_port_t" || f[0] == "ephemeral_port_t" || f[0] == "port_t" {
+			if port < start || port > end {
+				continue
+			}
+			if exactLocal {
+				if start == end && f[0] == wanted.kind {
+					compatible = true
+				}
+				continue
+			}
+			if f[0] == "unreserved_port_t" || f[0] == "reserved_port_t" || f[0] == "ephemeral_port_t" || f[0] == "port_t" {
 				continue
 			}
 			if f[0] != wanted.kind {
@@ -167,17 +180,46 @@ func configureSELinuxPorts(exec ExecRunner, fs FileSystem, configDir string, por
 			additions = append(additions, p)
 		}
 	}
-	if len(additions) == 0 {
-		return nil
-	}
 	ledger := configDir + "/selinux-ports"
 	pending := ledger + ".pending"
 	data, err := readPortLedger(fs, ledger)
 	if err != nil {
 		return err
 	}
-	if err := rootManagedFile(fs, pending); err != nil {
+	interrupted, err := readPortLedger(fs, pending)
+	if err != nil {
 		return err
+	}
+	if fs.Exists(pending) {
+		local, err := localSELinuxPorts(exec)
+		if err != nil {
+			return err
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(interrupted)), "\n") {
+			f := strings.Fields(line)
+			if len(f) == 0 {
+				continue
+			}
+			matches, err := matchSELinuxPort(local, selinuxPort{f[0], f[2]}, true)
+			if err != nil {
+				return err
+			}
+			if matches {
+				data = appendPortRecord(data, selinuxPort{f[0], f[2]})
+			}
+		}
+		if apply {
+			// Keep the original pending snapshot until its merged replacement is durable.
+			if err := savePortLedger(exec, fs, ledger, ledger+".reconcile", data); err != nil {
+				return fmt.Errorf("reconciling %s; retained pending ownership: %w", pending, err)
+			}
+			if err := fs.RemoveAll(pending); err != nil {
+				return err
+			}
+		}
+	}
+	if len(additions) == 0 {
+		return nil
 	}
 	if !apply {
 		return nil
@@ -189,36 +231,70 @@ func configureSELinuxPorts(exec ExecRunner, fs FileSystem, configDir string, por
 		if err := runChecked(exec, "semanage", "port", "-a", "-t", p.kind, "-p", "tcp", p.port); err != nil {
 			return fmt.Errorf("registering SELinux %s TCP %s: %w", p.kind, p.port, err)
 		}
-		record := p.kind + " tcp " + p.port + "\n"
-		if len(data) > 0 && data[len(data)-1] != '\n' {
-			data = append(data, '\n')
-		}
-		if !strings.Contains("\n"+string(data), "\n"+record) {
-			data = append(data, []byte(record)...)
-		}
-		saveErr := func() error {
-			if err := rootManagedFile(fs, pending); err != nil {
-				return err
+		data = appendPortRecord(data, p)
+		if saveErr := savePortLedger(exec, fs, ledger, pending, data); saveErr != nil {
+			cleanupErr := rollbackSELinuxPort(exec, p)
+			if cleanupErr == nil {
+				cleanupErr = fs.RemoveAll(pending)
 			}
-			if err := fs.WriteFile(pending, data, 0600); err != nil {
-				return err
-			}
-			if err := runChecked(exec, "chown", "root:root", pending); err != nil {
-				return err
-			}
-			if err := runChecked(exec, "chmod", "0600", pending); err != nil {
-				return err
-			}
-			if err := rootManagedFile(fs, ledger); err != nil {
-				return err
-			}
-			return fs.Rename(pending, ledger)
-		}()
-		if saveErr != nil {
-			return fmt.Errorf("saving ownership of SELinux %s TCP %s: %w", p.kind, p.port, errors.Join(saveErr, runChecked(exec, "semanage", "port", "-d", "-p", "tcp", p.port), fs.RemoveAll(pending)))
+			return fmt.Errorf("saving ownership of SELinux %s TCP %s; retry setup to reconcile %s: %w", p.kind, p.port, pending, errors.Join(saveErr, cleanupErr))
 		}
 	}
 	return nil
+}
+
+func appendPortRecord(data []byte, p selinuxPort) []byte {
+	record := p.kind + " tcp " + p.port + "\n"
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		data = append(data, '\n')
+	}
+	if !strings.Contains("\n"+string(data), "\n"+record) {
+		data = append(data, []byte(record)...)
+	}
+	return data
+}
+
+func savePortLedger(exec ExecRunner, fs FileSystem, ledger, pending string, data []byte) error {
+	if err := rootManagedFile(fs, pending); err != nil {
+		return err
+	}
+	if err := fs.WriteFile(pending, data, 0600); err != nil {
+		return err
+	}
+	if err := runChecked(exec, "chown", "root:root", pending); err != nil {
+		return err
+	}
+	if err := runChecked(exec, "chmod", "0600", pending); err != nil {
+		return err
+	}
+	if err := rootManagedFile(fs, ledger); err != nil {
+		return err
+	}
+	return fs.Rename(pending, ledger)
+}
+
+func localSELinuxPorts(exec ExecRunner) (string, error) {
+	out, code, err := exec.RunWithEnv(map[string]string{"LC_ALL": "C"}, "semanage", "port", "-l", "-C")
+	if err != nil || code != 0 {
+		return "", fmt.Errorf("listing local SELinux ports (exit %d): %s: %v", code, strings.TrimSpace(out), err)
+	}
+	return out, nil
+}
+
+func rollbackSELinuxPort(exec ExecRunner, p selinuxPort) error {
+	local, err := localSELinuxPorts(exec)
+	if err != nil {
+		return err
+	}
+	exact, err := matchSELinuxPort(local, p, true)
+	if err != nil {
+		return err
+	}
+	if !exact {
+		// Absent or changed by an administrator: never delete it.
+		return nil
+	}
+	return runChecked(exec, "semanage", "port", "-d", "-p", "tcp", p.port)
 }
 
 // Only exact product roots are relabeled; never broad /etc, /var/lib or /run.

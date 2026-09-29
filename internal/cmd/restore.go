@@ -3,6 +3,7 @@ package cmd
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -225,37 +226,11 @@ func (r *RestoreRunner) Run(archive string) error {
 	}
 	fmt.Fprintln(r.Out, "Config:   restored")
 	for name, source := range trees {
-		dest := recoveryTrees(r.Paths)[name]
-		if err := walkRecoveryTree(&osFileSystem{}, source, func(path string, info os.FileInfo) error {
-			rel, err := filepath.Rel(source, path)
-			if err != nil {
-				return err
-			}
-			target := filepath.Join(dest, rel)
-			owner, mode := "heimdall-caddy:heimdall-caddy", os.FileMode(0600)
-			if info.IsDir() {
-				mode = 0700
-			}
-			if name == "caddy-config" {
-				owner = "root:heimdall-caddy"
-				mode = info.Mode().Perm() & 0640
-				if info.IsDir() {
-					mode = 0750
-				}
-			}
-			if info.IsDir() {
-				err = r.FS.MkdirAll(target, mode)
-			} else {
-				err = r.FS.CopyFile(path, target)
-			}
-			if err != nil {
-				return err
-			}
-			return recoveryPermissions(r.Exec, target, owner, mode)
-		}); err != nil {
+		if err := r.restoreRecoveryTree(source, recoveryTrees(r.Paths)[name], name); err != nil {
 			return fmt.Errorf("restoring %s: %w", name, err)
 		}
 	}
+
 	if hasSQL {
 		_, code, err := r.Exec.RunWithEnv(dbCfg.PgEnv(), binary, "-h", dbCfg.Host, "-p", dbCfg.PortStr(), "-U", dbCfg.User, "-d", dbCfg.DBName, "-X", "-v", "ON_ERROR_STOP=1", "-f", sqlBackup)
 		if err != nil || code != 0 {
@@ -267,6 +242,91 @@ func (r *RestoreRunner) Run(archive string) error {
 		fmt.Fprintln(r.Out, "Legacy archive restored configuration only; current database data was not changed.")
 	}
 	fmt.Fprintln(r.Out, "Run successful setup and migrations before starting the app: sudo heimdall-cli setup --non-interactive")
+	return nil
+}
+
+// Never write or change metadata through Caddy-owned descendants. Prepare a
+// complete replacement beneath a root-only sibling, then move directory entries.
+// The protected parent remains root-owned even after its child belongs to Caddy.
+func (r *RestoreRunner) restoreRecoveryTree(source, dest, kind string) (result error) {
+	parent := filepath.Dir(dest)
+	output, code, err := r.Exec.Run("mktemp", "-d", filepath.Join(parent, ".heimdall-restore.XXXXXX"))
+	if err != nil || code != 0 {
+		return fmt.Errorf("creating private restore staging (exit %d): %v", code, err)
+	}
+	staging := strings.TrimSpace(output)
+	if filepath.Dir(staging) != parent || !strings.HasPrefix(filepath.Base(staging), ".heimdall-restore.") {
+		return fmt.Errorf("invalid restore staging path: %q", staging)
+	}
+	retain := false
+	defer func() {
+		if !retain {
+			if err := r.FS.RemoveAll(staging); err != nil {
+				result = errors.Join(result, fmt.Errorf("removing restore staging %s: %w", staging, err))
+				retain = true
+			}
+		}
+		if retain {
+			fmt.Fprintf(r.ErrOut, "Restore staging retained for recovery: %s\n", staging)
+		}
+	}()
+	if err := recoveryPermissions(r.Exec, staging, "root:root", 0700); err != nil {
+		return err
+	}
+	replacement := filepath.Join(staging, "restored")
+	if err := walkRecoveryTree(&osFileSystem{}, source, func(path string, info os.FileInfo) error {
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(replacement, rel)
+		owner, mode := "heimdall-caddy:heimdall-caddy", os.FileMode(0600)
+		if info.IsDir() {
+			mode = 0700
+		}
+		if kind == "caddy-config" {
+			owner = "root:heimdall-caddy"
+			mode = info.Mode().Perm() & 0640
+			if info.IsDir() {
+				mode = 0750
+			}
+		}
+		if info.IsDir() {
+			err = r.FS.MkdirAll(target, mode)
+		} else {
+			err = r.FS.CopyFile(path, target)
+		}
+		if err != nil {
+			return err
+		}
+		return recoveryPermissions(r.Exec, target, owner, mode)
+	}); err != nil {
+		return err
+	}
+	previous := filepath.Join(staging, "previous")
+	moved := false
+	if err := r.FS.Rename(dest, previous); err == nil {
+		moved = true
+	} else if !os.IsNotExist(err) {
+		retain = true
+		return fmt.Errorf("retaining previous tree: %w", err)
+	}
+	if err := r.FS.Rename(replacement, dest); err != nil {
+		retain = true
+		if moved {
+			if rollback := r.FS.Rename(previous, dest); rollback != nil {
+				return errors.Join(fmt.Errorf("publishing restored tree: %w", err), fmt.Errorf("restoring previous tree from %s: %w", previous, rollback))
+			}
+		}
+		return fmt.Errorf("publishing restored tree: %w", err)
+	}
+	// Removing an entry never follows a symlink moved out of the old tree.
+	if moved {
+		if err := r.FS.RemoveAll(previous); err != nil {
+			retain = true
+			return fmt.Errorf("removing previous tree retained at %s: %w", previous, err)
+		}
+	}
 	return nil
 }
 
