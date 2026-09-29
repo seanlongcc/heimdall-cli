@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -82,4 +83,55 @@ func TestSetPort_RestartsService(t *testing.T) {
 	err := runner.Run("8080")
 	require.NoError(t, err)
 	assert.Contains(t, systemd.Actions, "restart:"+ServiceName)
+}
+
+func TestSetPortBundledRollbackAndConfigDelegation(t *testing.T) {
+	for _, failure := range []string{"validate", "restart", "reload", "none"} {
+		t.Run(failure, func(t *testing.T) {
+			setup := bundledSetupFixture(t)
+			fs := setup.FS.(*FakeFileSystem)
+			exec := setup.Exec.(*FakeExecRunner)
+			fs.Files[setup.Paths.ConfigDir+"/caddy/Caddyfile"] = []byte("old config\n")
+			sd := &portFailureSystemd{FakeSystemdRunner: setup.Systemd.(*FakeSystemdRunner), failure: failure}
+			sd.ActiveServices[bundledCaddyService] = true
+			if failure == "validate" {
+				exec.Results["runuser -u heimdall-caddy"] = FakeExecResult{ExitCode: 1}
+			}
+			port := &SetPortRunner{Exec: exec, Env: setup.Env, Systemd: sd, FS: fs, Paths: setup.Paths, Out: setup.Out}
+			cfg := &ConfigRunner{Env: setup.Env, Out: setup.Out, Port: port}
+			err := cfg.Set("PORT", "4567")
+			if failure == "none" {
+				require.NoError(t, err)
+				require.Equal(t, "4567", setup.Env.(*FakeEnvManager).Env["PORT"])
+				require.Contains(t, string(fs.Files[setup.Paths.ConfigDir+"/caddy/Caddyfile"]), "127.0.0.1:4567")
+			} else {
+				require.Error(t, err)
+				require.Equal(t, "3210", setup.Env.(*FakeEnvManager).Env["PORT"])
+				require.Equal(t, "old config\n", string(fs.Files[setup.Paths.ConfigDir+"/caddy/Caddyfile"]))
+			}
+			if failure == "validate" {
+				require.Empty(t, sd.Actions)
+			}
+		})
+	}
+}
+
+type portFailureSystemd struct {
+	*FakeSystemdRunner
+	failure string
+}
+
+func (s *portFailureSystemd) Restart(unit string) error {
+	if s.failure == "restart" {
+		s.failure = ""
+		return fmt.Errorf("restart failed")
+	}
+	return s.FakeSystemdRunner.Restart(unit)
+}
+func (s *portFailureSystemd) Reload(unit string) error {
+	if s.failure == "reload" {
+		s.failure = ""
+		return fmt.Errorf("reload failed")
+	}
+	return s.FakeSystemdRunner.Reload(unit)
 }

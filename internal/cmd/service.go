@@ -43,7 +43,7 @@ func (r *ServiceRunner) Stop() error {
 	if err := r.Systemd.Stop(ServiceName); err != nil {
 		return fmt.Errorf("failed to stop service: %w", err)
 	}
-	fmt.Fprintln(r.Out, "Service stopped.")
+	fmt.Fprintln(r.Out, "Service stopped. Database and proxy services remain running.")
 	return nil
 }
 
@@ -102,6 +102,15 @@ func (r *ServiceRunner) Diag() error {
 	}
 	fmt.Fprintln(r.Out)
 
+	if env, err := r.Env.ReadEnv(); err == nil {
+		fmt.Fprintf(r.Out, "  Database: %s (%s:%s)\n  Proxy: %s (%s)\n", env["HEIMDALL_DATABASE_MODE"], env["DATABASE_HOST"], env["DATABASE_PORT"], env["HEIMDALL_PROXY_MODE"], env["EXTERNAL_URL"])
+		for _, item := range []struct{ key, unit string }{{"HEIMDALL_DATABASE_MODE", bundledPGService}, {"HEIMDALL_PROXY_MODE", bundledCaddyService}} {
+			if env[item.key] == "bundled" {
+				active, _ := r.Systemd.IsActive(item.unit)
+				fmt.Fprintf(r.Out, "  %s running: %t (journalctl -u %s)\n", item.unit, active, item.unit)
+			}
+		}
+	}
 	// SELinux denials
 	fmt.Fprintln(r.Out, "--- SELinux Denials ---")
 	out, _, _ := r.Exec.Run("ausearch", "-m", "avc", "-ts", "recent")
@@ -147,7 +156,7 @@ func (r *ServiceRunner) Diag() error {
 	fmt.Fprintln(r.Out, "--- Listening Ports ---")
 	out, _, _ = r.Exec.Run("ss", "-tlnp")
 	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, ":3000") || strings.Contains(line, ":5432") {
+		if strings.Contains(line, "heimdall") || strings.Contains(line, ":3000") || strings.Contains(line, ":5432") || strings.Contains(line, ":55432") || strings.Contains(line, ":443") {
 			fmt.Fprintf(r.Out, "  %s\n", line)
 		}
 	}
@@ -218,7 +227,7 @@ func NewStopCmd(runner *ServiceRunner) *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop",
 		Short: "Stop the Heimdall server service",
-		Long: `Stop the heimdall-server systemd service. This gracefully shuts down the
+		Long: `Stop the heimdall-server systemd service. Selected database and proxy services remain running. This gracefully shuts down the
 Node.js backend process. The service can be restarted later with
 'heimdall-cli start' or 'systemctl start heimdall-server'. Requires
 root privileges.`,

@@ -456,3 +456,26 @@ func TestStatusRPMReportsOwnershipWithoutHostnameInference(t *testing.T) {
 		require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
 	}
 }
+
+func TestStatusBundledRuntimeInventoryAndSelectedUnits(t *testing.T) {
+	for _, mode := range []string{"bundled", "external"} {
+		t.Run(mode, func(t *testing.T) {
+			r, out := newTestStatusRunner()
+			r.JSON = true
+			r.Env.(*FakeEnvManager).Env = map[string]string{"HEIMDALL_DATABASE_MODE": mode, "HEIMDALL_PROXY_MODE": mode, "DATABASE_HOST": "localhost", "DATABASE_PORT": "55432", "EXTERNAL_URL": "https://example.test"}
+			fs := r.FS.(*FakeFileSystem)
+			fs.Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{"runtimes":{"node":{"version":"22.23.3"},"postgresql":{"version":"18.6"},"caddy":{"version":"2.11.4"}}}`)
+			fs.Files[r.Paths.RuntimePath("postgresql", "bin", "psql")] = nil
+			require.NoError(t, r.Run())
+			require.Contains(t, out.String(), `"node": "22.23.3"`)
+			require.Contains(t, out.String(), `"url": "https://example.test"`)
+			if mode == "bundled" {
+				require.Contains(t, out.String(), `"heimdall-postgresql": false`)
+				require.Contains(t, out.String(), `"heimdall-caddy": false`)
+			} else {
+				require.NotContains(t, out.String(), `"heimdall-postgresql"`)
+				require.NotContains(t, out.String(), `"heimdall-caddy"`)
+			}
+		})
+	}
+}

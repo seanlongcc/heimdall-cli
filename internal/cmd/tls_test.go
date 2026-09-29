@@ -2,9 +2,18 @@ package cmd
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"math/big"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -426,4 +435,114 @@ func TestStepTLS_RequiredFileFailure(t *testing.T) {
 			require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
 		})
 	}
+}
+
+func TestBundledCaddyUsesConfiguredPort(t *testing.T) {
+	config, err := renderBundledCaddy(map[string]string{"PORT": "3210", "EXTERNAL_URL": "https://heimdall.example.test", "HEIMDALL_TLS_MODE": "internal"})
+	require.NoError(t, err)
+	require.Contains(t, config, "127.0.0.1:3210")
+	require.Contains(t, config, "unix//run/heimdall-caddy/admin.sock")
+	require.Contains(t, config, "tls internal")
+	require.NotContains(t, config, "127.0.0.1:3000")
+}
+
+func TestBundledCaddyRejectsUnsafeSettings(t *testing.T) {
+	for _, value := range []string{"https://u:p@example.test", "https://example.test/path", "https://example.test?q=x", "https://example.test#x", "file:///tmp/x", "https://example.test:99999", "https://bad_{host}.test"} {
+		_, err := renderBundledCaddy(map[string]string{"PORT": "3210", "EXTERNAL_URL": value, "HEIMDALL_TLS_MODE": "internal"})
+		require.Error(t, err, value)
+	}
+	_, err := renderBundledCaddy(map[string]string{"PORT": "3000\ntls internal", "EXTERNAL_URL": "https://example.test", "HEIMDALL_TLS_MODE": "internal"})
+	require.Error(t, err)
+}
+
+func TestBundledCaddyCustomAndRerunPreserveCA(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	certificate := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), DNSNames: []string{"heimdall.example.test"}}
+	der, err := x509.CreateCertificate(rand.Reader, certificate, certificate, &key.PublicKey, key)
+	require.NoError(t, err)
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	require.NoError(t, err)
+	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	private := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	r := bundledSetupFixture(t)
+	r.SkipDB = true
+	r.TLSMode = "custom"
+	r.TLSCert = "/source/cert.pem"
+	r.TLSKey = "/source/key.pem"
+	fs := r.FS.(*FakeFileSystem)
+	fs.Files[r.TLSCert] = cert
+	fs.Files[r.TLSKey] = private
+	fs.Files[bundledCaddyRoot] = []byte("unchanged CA")
+	require.NoError(t, r.Run())
+	env := r.Env.(*FakeEnvManager).Env
+	require.Equal(t, r.Paths.ConfigDir+"/caddy/certs/server.crt", env["HEIMDALL_TLS_CERT"])
+	require.Equal(t, private, fs.Files[env["HEIMDALL_TLS_KEY"]])
+	require.Contains(t, string(fs.Files[r.Paths.ConfigDir+"/caddy/Caddyfile"]), `tls "/etc/heimdall-server/caddy/certs/server.crt" "/etc/heimdall-server/caddy/certs/server.key"`)
+	delete(fs.Files, "/source/cert.pem")
+	delete(fs.Files, "/source/key.pem")
+	r.TLSCert, r.TLSKey = "", ""
+	require.NoError(t, r.Run())
+	require.Equal(t, cert, fs.Files[env["HEIMDALL_TLS_CERT"]])
+	require.Equal(t, "unchanged CA", string(fs.Files[bundledCaddyRoot]))
+	for _, call := range r.Exec.(*FakeExecRunner).Calls {
+		require.NotEqual(t, "update-ca-trust", call.Name)
+	}
+}
+
+func TestBundledCaddyRejectsCertificateBeforeReplacingConfig(t *testing.T) {
+	r := bundledSetupFixture(t)
+	r.SkipDB = true
+	r.TLSMode = "custom"
+	r.TLSCert = "/bad.crt"
+	r.TLSKey = "/bad.key"
+	fs := r.FS.(*FakeFileSystem)
+	fs.Files["/bad.crt"] = []byte("invalid")
+	fs.Files["/bad.key"] = []byte("invalid")
+	fs.Files[r.Paths.ConfigDir+"/caddy/Caddyfile"] = []byte("retained")
+	before, _ := r.Env.ReadEnv()
+	require.Error(t, r.Run())
+	require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+	require.Equal(t, "retained", string(fs.Files[r.Paths.ConfigDir+"/caddy/Caddyfile"]))
+	require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
+}
+
+func TestBundledManagedPathsRejectSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	require.NoError(t, os.Mkdir(target, 0700))
+	link := filepath.Join(dir, "link")
+	require.NoError(t, os.Symlink(target, link))
+	require.ErrorContains(t, safeManagedPath(&osFileSystem{}, link+"/Caddyfile"), "unsafe managed path")
+	file := filepath.Join(target, "file")
+	require.NoError(t, os.WriteFile(file, []byte("unchanged"), 0600))
+	require.NoError(t, os.Symlink(file, filepath.Join(target, "Caddyfile")))
+	require.ErrorContains(t, safeManagedPath(&osFileSystem{}, filepath.Join(target, "Caddyfile")), "unsafe managed path")
+	require.NoError(t, os.Link(file, filepath.Join(target, "hardlink")))
+	require.ErrorContains(t, safeManagedPath(&osFileSystem{}, filepath.Join(target, "hardlink")), "hard-linked")
+	data, err := os.ReadFile(file)
+	require.NoError(t, err)
+	require.Equal(t, "unchanged", string(data))
+}
+
+func TestBundledCaddyStartFailureRestoresConfiguration(t *testing.T) {
+	r := bundledSetupFixture(t)
+	r.SkipDB = true
+	fs := r.FS.(*FakeFileSystem)
+	fs.Files[r.Paths.ConfigDir+"/caddy/Caddyfile"] = []byte("old config")
+	r.Systemd = &caddyStartFailure{r.Systemd.(*FakeSystemdRunner)}
+	before, _ := r.Env.ReadEnv()
+	require.Error(t, r.Run())
+	require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+	require.Equal(t, "old config", string(fs.Files[r.Paths.ConfigDir+"/caddy/Caddyfile"]))
+	require.NotContains(t, r.Systemd.(*caddyStartFailure).Actions, "restart:"+ServiceName)
+}
+
+type caddyStartFailure struct{ *FakeSystemdRunner }
+
+func (s *caddyStartFailure) Start(unit string) error {
+	if unit == bundledCaddyService {
+		return fmt.Errorf("start failed")
+	}
+	return s.FakeSystemdRunner.Start(unit)
 }

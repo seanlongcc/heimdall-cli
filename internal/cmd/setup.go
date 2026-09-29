@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -9,9 +10,11 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 )
@@ -34,6 +37,8 @@ type SetupRunner struct {
 	TLSMode        string
 	flagChanged    map[string]bool
 	bundledRuntime bool
+	stageConfig    bool
+	pendingConfig  map[string]string
 
 	// Flags
 	Interactive bool
@@ -165,11 +170,17 @@ func (r *SetupRunner) Run() error {
 		}
 	}
 
+	r.stageConfig = r.bundledRuntime && !r.Reconfigure
+	defer func() { r.stageConfig = false }()
 	// Step 1: Configuration
 	fmt.Fprintln(r.Out, "=== Step 1/7: Configuration ===")
 	if err := r.configure(existing); err != nil {
 		return WrapError(err, "configuration failed",
 			"Check file permissions: ls -la "+r.Env.GetEnvFilePath())
+	}
+
+	if r.stageConfig {
+		return r.runBundledSetup(existing)
 	}
 
 	isLocalDB := r.DatabaseMode == "bundled"
@@ -912,10 +923,6 @@ func (r *SetupRunner) writeConfig(existing map[string]string,
 		return err
 	}
 
-	if err := r.Env.WriteEnvFile(entries); err != nil {
-		return fmt.Errorf("writing env file: %w", err)
-	}
-
 	// Store resolved values back to runner so subsequent steps use them
 	// (e.g., stepConnectionTest needs the auto-generated DB password).
 	r.DBHost = dbHost
@@ -927,6 +934,18 @@ func (r *SetupRunner) writeConfig(existing map[string]string,
 	r.DBName = dbName
 	r.ExternalURL = externalURL
 
+	if r.stageConfig {
+		r.pendingConfig = entries
+		return nil
+	}
+	if r.bundledRuntime {
+		if err := safeManagedPath(r.FS, r.Env.GetEnvFilePath()); err != nil {
+			return err
+		}
+	}
+	if err := r.Env.WriteEnvFile(entries); err != nil {
+		return fmt.Errorf("writing env file: %w", err)
+	}
 	// Set file permissions (matches heimdall-configure.sh)
 	r.Exec.Run("chown", "root:heimdall", r.Env.GetEnvFilePath())
 	r.Exec.Run("chmod", "0640", r.Env.GetEnvFilePath())
@@ -940,15 +959,17 @@ func (r *SetupRunner) writeConfig(existing map[string]string,
 // /usr/libexec/heimdall-server/postgres-setup.sh.
 func (r *SetupRunner) stepPostgresBootstrap() error {
 	bootstrapper := &PostgresBootstrapRunner{
-		Exec:       r.Exec,
-		FS:         r.FS,
-		Systemd:    r.Systemd,
-		Out:        r.Out,
-		DBHost:     r.DBHost,
-		DBPort:     r.DBPort,
-		DBUser:     r.DBUser,
-		DBPassword: r.DBPassword,
-		DBName:     r.DBName,
+		Paths:        r.Paths,
+		DatabaseMode: r.DatabaseMode,
+		Exec:         r.Exec,
+		FS:           r.FS,
+		Systemd:      r.Systemd,
+		Out:          r.Out,
+		DBHost:       r.DBHost,
+		DBPort:       r.DBPort,
+		DBUser:       r.DBUser,
+		DBPassword:   r.DBPassword,
+		DBName:       r.DBName,
 	}
 	return bootstrapper.Run()
 }
@@ -1136,6 +1157,28 @@ func (r *SetupRunner) configureCaddyfile(strategy tlsStrategy, host, caddyfileDs
 }
 
 func (r *SetupRunner) stepTLS() error {
+	bundled, err := r.Paths.hasRuntime(r.FS)
+	if err != nil {
+		return err
+	}
+	if bundled {
+		env, err := r.Env.ReadEnv()
+		if err != nil {
+			return err
+		}
+		update, err := r.prepareBundledCaddy(env)
+		if err != nil {
+			return err
+		}
+		if err := update.apply(); err != nil {
+			return err
+		}
+		if r.TLSMode == "internal" {
+			fmt.Fprintln(r.Out, "  Import the private Caddy CA where needed:", bundledCaddyRoot)
+		}
+		return nil
+	}
+
 	// Check if Caddy is available
 	_, exitCode, err := r.Exec.Run("sh", "-c", `command -v "$1"`, "sh", "caddy")
 	if err != nil {
@@ -1315,7 +1358,7 @@ func (r *SetupRunner) stepSecurityPolicies() {
 	// firewalld
 	active, _ := r.Systemd.IsActive("firewalld")
 	if active {
-		if r.SkipTLS {
+		if r.SkipTLS || (r.bundledRuntime && r.ProxyMode != "bundled") {
 			r.Exec.Run("firewall-cmd", "--permanent", fmt.Sprintf("--add-port=%s/tcp", port))
 			fmt.Fprintf(r.Out, "  firewalld: port %s/tcp enabled\n", port)
 		} else {
@@ -1329,7 +1372,11 @@ func (r *SetupRunner) stepSecurityPolicies() {
 
 	// File permission hardening
 	r.Exec.Run("chown", "root:heimdall", r.Paths.ConfigDir)
-	r.Exec.Run("chmod", "0750", r.Paths.ConfigDir)
+	configMode := "0750"
+	if r.bundledRuntime {
+		configMode = "0751"
+	}
+	r.Exec.Run("chmod", configMode, r.Paths.ConfigDir)
 	r.Exec.Run("chown", "-R", "heimdall:heimdall", r.Paths.DataDir)
 	r.Exec.Run("chmod", "0750", r.Paths.DataDir)
 	r.Exec.Run("chmod", "0700", r.Paths.DataDir+"/backups")
@@ -1439,4 +1486,634 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// safeManagedPath rejects symlinks and unexpected objects before root writes.
+// Ancestors must be directories; a missing leaf is allowed for initial setup.
+func safeManagedPath(fs FileSystem, path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("unsafe managed path: %s", path)
+	}
+	for current := path; current != "/"; current = filepath.Dir(current) {
+		info, err := fs.Lstat(current)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok && info.Mode().IsRegular() && stat.Nlink > 1 {
+			return fmt.Errorf("unsafe hard-linked managed path: %s", current)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || (current != path && !info.IsDir()) || (current == path && !info.Mode().IsRegular()) {
+			return fmt.Errorf("unsafe managed path: %s", current)
+		}
+	}
+	return nil
+}
+
+func requireRegular(fs FileSystem, path string) error {
+	if err := safeManagedPath(fs, path); err != nil {
+		return err
+	}
+	info, err := fs.Stat(path)
+	if err != nil {
+		return fmt.Errorf("required runtime/configuration file %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("expected a regular file: %s", path)
+	}
+	return nil
+}
+
+func runChecked(exec ExecRunner, name string, args ...string) error {
+	out, code, err := exec.Run(name, args...)
+	if err != nil || code != 0 {
+		return fmt.Errorf("%s failed (exit %d): %s: %v", name, code, strings.TrimSpace(out), err)
+	}
+	return nil
+}
+
+func checkOwnedPort(exec ExecRunner, systemd SystemdRunner, port int, unit string, udp bool) error {
+	flags := "-ltnp"
+	if udp {
+		flags = "-lunp"
+	}
+	out, code, err := exec.Run("ss", "-H", flags, "sport = :"+strconv.Itoa(port))
+	if err != nil || code != 0 {
+		return fmt.Errorf("cannot check port %d with ss (exit %d): %v", port, code, err)
+	}
+	if strings.TrimSpace(out) == "" {
+		return nil
+	}
+	active, err := systemd.IsActive(unit)
+	if err != nil {
+		return err
+	}
+	pid, err := systemd.ShowProperty(unit, "MainPID")
+	if err != nil {
+		return err
+	}
+	pidNum, _ := strconv.Atoi(strings.TrimSpace(pid))
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(line)
+		if !active || pidNum <= 0 || len(fields) < 6 || (fields[0] != "LISTEN" && fields[0] != "UNCONN") || !strings.HasSuffix(fields[3], ":"+strconv.Itoa(port)) || !strings.Contains(line, "pid="+strings.TrimSpace(pid)+",") {
+			return fmt.Errorf("port %d is occupied by a process outside %s; choose another port or reconfigure its owner", port, unit)
+		}
+		for _, match := range regexp.MustCompile(`pid=([0-9]+),`).FindAllStringSubmatch(line, -1) {
+			if match[1] != strings.TrimSpace(pid) {
+				return fmt.Errorf("port %d has another owner", port)
+			}
+		}
+	}
+	return nil
+}
+
+const bundledCaddyService = "heimdall-caddy"
+const bundledCaddyRoot = "/var/lib/heimdall-caddy/data/caddy/pki/authorities/local/root.crt"
+
+func renderBundledCaddy(env map[string]string) (string, error) {
+	return renderPrivateCaddy(env, ConfigDir+"/caddy")
+}
+
+func renderPrivateCaddy(env map[string]string, dir string) (string, error) {
+	port, err := strconv.Atoi(envDefault(env, "PORT", DefaultAppPort))
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("PORT must be between 1 and 65535")
+	}
+	u, err := validatePublicURL(env["EXTERNAL_URL"])
+	if err != nil {
+		return "", err
+	}
+	global := "{\n    admin unix//run/heimdall-caddy/admin.sock\n    skip_install_trust\n"
+	tlsLine := ""
+	switch env["HEIMDALL_TLS_MODE"] {
+	case "internal":
+		tlsLine = "    tls internal\n"
+	case "custom":
+		tlsLine = fmt.Sprintf("    tls %s %s\n", strconv.Quote(dir+"/certs/server.crt"), strconv.Quote(dir+"/certs/server.key"))
+	case "acme":
+		if email := env["ADMIN_EMAIL"]; email != "" {
+			if strings.ContainsAny(email, "\r\n{}") {
+				return "", fmt.Errorf("ADMIN_EMAIL contains unsafe characters")
+			}
+			global += "    email " + strconv.Quote(email) + "\n"
+		}
+	default:
+		return "", fmt.Errorf("HEIMDALL_TLS_MODE must be acme, internal or custom")
+	}
+	return global + "}\n" + strconv.Quote(u.Scheme+"://"+u.Host) + " {\n" + tlsLine + fmt.Sprintf("    reverse_proxy %s\n}\n", strconv.Quote("127.0.0.1:"+strconv.Itoa(port))), nil
+}
+
+type savedFile struct {
+	path   string
+	data   []byte
+	mode   os.FileMode
+	exists bool
+}
+
+func snapshotFile(fs FileSystem, path string) (savedFile, error) {
+	s := savedFile{path: path, mode: 0640}
+	if err := safeManagedPath(fs, path); err != nil {
+		return s, err
+	}
+	data, err := fs.ReadFile(path)
+	if os.IsNotExist(err) {
+		return s, nil
+	}
+	if err != nil {
+		return s, err
+	}
+	info, err := fs.Stat(path)
+	if err != nil {
+		return s, err
+	}
+	s.data, s.mode, s.exists = data, info.Mode().Perm(), true
+	return s, nil
+}
+func (s savedFile) restore(fs FileSystem) error {
+	if err := safeManagedPath(fs, s.path); err != nil {
+		return err
+	}
+	if !s.exists {
+		return fs.RemoveAll(s.path)
+	}
+	return fs.WriteFile(s.path, s.data, s.mode)
+}
+
+type caddyUpdate struct {
+	runner  *SetupRunner
+	config  string
+	pending string
+	saved   []savedFile
+	certs   map[string][]byte
+	active  bool
+	enabled bool
+	applied bool
+}
+
+func (r *SetupRunner) prepareBundledCaddy(env map[string]string) (*caddyUpdate, error) {
+	dir := r.Paths.ConfigDir + "/caddy"
+	config, err := renderPrivateCaddy(env, dir)
+	if err != nil {
+		return nil, err
+	}
+	binary := r.Paths.RuntimePath("caddy", "caddy")
+	if err := requireRegular(r.FS, binary); err != nil {
+		return nil, err
+	}
+	u, _ := url.Parse(env["EXTERNAL_URL"])
+	port := 443
+	if u.Scheme == "http" {
+		port = 80
+	}
+	if u.Port() != "" {
+		port, _ = strconv.Atoi(u.Port())
+	}
+	ports := []int{port}
+	if u.Scheme == "https" && port != 80 {
+		ports = append(ports, 80)
+	}
+	for _, p := range ports {
+		if err := checkOwnedPort(r.Exec, r.Systemd, p, bundledCaddyService, false); err != nil {
+			return nil, err
+		}
+	}
+	if u.Scheme == "https" {
+		if err := checkOwnedPort(r.Exec, r.Systemd, port, bundledCaddyService, true); err != nil {
+			return nil, err
+		}
+	}
+	update := &caddyUpdate{runner: r, config: config, pending: dir + "/Caddyfile.pending", certs: map[string][]byte{}}
+	update.active, err = r.Systemd.IsActive(bundledCaddyService)
+	if err != nil {
+		return nil, err
+	}
+	state, err := r.Systemd.ShowProperty(bundledCaddyService, "UnitFileState")
+	if err != nil {
+		return nil, err
+	}
+	update.enabled = state == "enabled" || state == "enabled-runtime"
+	for _, path := range []string{dir + "/Caddyfile", dir + "/certs/server.crt", dir + "/certs/server.key"} {
+		saved, err := snapshotFile(r.FS, path)
+		if err != nil {
+			return nil, err
+		}
+		update.saved = append(update.saved, saved)
+	}
+	for _, path := range []string{update.pending, dir + "/certs/server.crt.pending", dir + "/certs/server.key.pending", "/var/lib/heimdall-caddy/data/.heimdall-check", "/var/lib/heimdall-caddy/config/.heimdall-check"} {
+		if err := safeManagedPath(r.FS, path); err != nil {
+			return nil, err
+		}
+	}
+	candidate := config
+	if env["HEIMDALL_TLS_MODE"] == "custom" {
+		cert, err := r.FS.ReadFile(env["HEIMDALL_TLS_CERT"])
+		if err != nil {
+			return nil, fmt.Errorf("reading custom TLS certificate: %w", err)
+		}
+		key, err := r.FS.ReadFile(env["HEIMDALL_TLS_KEY"])
+		if err != nil {
+			return nil, fmt.Errorf("reading custom TLS key: %w", err)
+		}
+		if _, err := tls.X509KeyPair(cert, key); err != nil {
+			return nil, fmt.Errorf("invalid custom TLS certificate/key: %w", err)
+		}
+		update.certs[dir+"/certs/server.crt"] = cert
+		update.certs[dir+"/certs/server.key"] = key
+		for path := range update.certs {
+			candidate = strings.ReplaceAll(candidate, strconv.Quote(path), strconv.Quote(path+".pending"))
+		}
+	}
+	for _, path := range []string{dir, dir + "/certs"} {
+		if err := r.FS.MkdirAll(path, 0750); err != nil {
+			return nil, err
+		}
+		if err := runChecked(r.Exec, "chown", "root:heimdall-caddy", path); err != nil {
+			return nil, err
+		}
+		if err := runChecked(r.Exec, "chmod", "0750", path); err != nil {
+			return nil, err
+		}
+	}
+	if err := runChecked(r.Exec, "chmod", "0751", r.Paths.ConfigDir); err != nil {
+		return nil, err
+	}
+	// Validation uses exactly the service account and private state locations.
+	for _, path := range []string{"/var/lib/heimdall-caddy/data", "/var/lib/heimdall-caddy/config"} {
+		if err := r.FS.MkdirAll(path, 0700); err != nil {
+			return nil, err
+		}
+		if err := runChecked(r.Exec, "chown", "heimdall-caddy:heimdall-caddy", path); err != nil {
+			return nil, err
+		}
+	}
+	defer update.cleanup()
+	if err := r.FS.RemoveAll(update.pending); err != nil {
+		return nil, err
+	}
+	for path, data := range update.certs {
+		if err := r.FS.RemoveAll(path + ".pending"); err != nil {
+			return nil, err
+		}
+		if err := r.FS.WriteFile(path+".pending", data, 0640); err != nil {
+			return nil, err
+		}
+		if err := runChecked(r.Exec, "chown", "root:heimdall-caddy", path+".pending"); err != nil {
+			return nil, err
+		}
+	}
+	if err := r.FS.WriteFile(update.pending, []byte(candidate), 0640); err != nil {
+		return nil, err
+	}
+	if err := runChecked(r.Exec, "chown", "root:heimdall-caddy", update.pending); err != nil {
+		return nil, err
+	}
+	if err := runChecked(r.Exec, "runuser", "-u", "heimdall-caddy", "--", "env", "XDG_DATA_HOME=/var/lib/heimdall-caddy/data", "XDG_CONFIG_HOME=/var/lib/heimdall-caddy/config", binary, "validate", "--config", update.pending, "--adapter", "caddyfile"); err != nil {
+		return nil, fmt.Errorf("validating private Caddy configuration: %w", err)
+	}
+	return update, nil
+}
+func (u *caddyUpdate) cleanup() {
+	_ = u.runner.FS.RemoveAll(u.pending)
+	for path := range u.certs {
+		_ = u.runner.FS.RemoveAll(path + ".pending")
+	}
+}
+func (u *caddyUpdate) apply() (err error) {
+	r := u.runner
+	defer u.cleanup()
+	u.applied = true
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, u.rollback())
+		}
+	}()
+	for path, data := range u.certs {
+		if err := safeManagedPath(r.FS, path); err != nil {
+			return err
+		}
+		if err := r.FS.WriteFile(path, data, 0640); err != nil {
+			return err
+		}
+		if err := runChecked(r.Exec, "chown", "root:heimdall-caddy", path); err != nil {
+			return err
+		}
+		if err := runChecked(r.Exec, "chmod", "0640", path); err != nil {
+			return err
+		}
+	}
+	if err := safeManagedPath(r.FS, u.pending); err != nil {
+		return err
+	}
+	if err := r.FS.WriteFile(u.pending, []byte(u.config), 0640); err != nil {
+		return err
+	}
+	if err := runChecked(r.Exec, "chown", "root:heimdall-caddy", u.pending); err != nil {
+		return err
+	}
+	if err := runChecked(r.Exec, "chmod", "0640", u.pending); err != nil {
+		return err
+	}
+	if err := r.FS.Rename(u.pending, u.saved[0].path); err != nil {
+		return err
+	}
+	if err := r.Systemd.Enable(bundledCaddyService); err != nil {
+		return err
+	}
+	if u.active {
+		err = r.Systemd.Reload(bundledCaddyService)
+	} else {
+		err = r.Systemd.Start(bundledCaddyService)
+	}
+	if err != nil {
+		return err
+	}
+	active, err := r.Systemd.IsActive(bundledCaddyService)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return fmt.Errorf("private Caddy is not active after activation")
+	}
+	return nil
+}
+func (u *caddyUpdate) rollback() error {
+	if !u.applied {
+		return nil
+	}
+	u.applied = false
+	var errs []error
+	for _, saved := range u.saved {
+		errs = append(errs, saved.restore(u.runner.FS))
+	}
+	if u.active {
+		errs = append(errs, u.runner.Systemd.Reload(bundledCaddyService))
+	} else {
+		errs = append(errs, u.runner.Systemd.Stop(bundledCaddyService))
+	}
+	if !u.enabled {
+		errs = append(errs, runChecked(u.runner.Exec, "systemctl", "disable", bundledCaddyService))
+	}
+	return errors.Join(errs...)
+}
+
+const databaseDependency = "/etc/systemd/system/heimdall-server.service.d/database.conf"
+const databaseDependencyContent = "[Unit]\nRequires=heimdall-postgresql.service\nAfter=heimdall-postgresql.service\n"
+
+// RPM setup stages settings until every replacement can be validated. A failed
+// activation restores configuration; a migration failure always leaves the app stopped.
+func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
+	env := r.pendingConfig
+	port, parseErr := strconv.Atoi(envDefault(env, "PORT", DefaultAppPort))
+	if parseErr != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("PORT must be between 1 and 65535")
+	}
+	if err := checkOwnedPort(r.Exec, r.Systemd, port, ServiceName, false); err != nil {
+		return err
+	}
+	if !r.SkipTLS && r.ProxyMode != "bundled" {
+		if _, err := validatePublicURL(env["EXTERNAL_URL"]); err != nil {
+			return err
+		}
+	}
+	before, err := snapshotFile(r.FS, r.Env.GetEnvFilePath())
+	if err != nil {
+		return err
+	}
+	dependency, err := snapshotFile(r.FS, databaseDependency)
+	if err != nil {
+		return err
+	}
+	if dependency.exists && string(dependency.data) != databaseDependencyContent {
+		return fmt.Errorf("refusing to replace an unrecognized database dependency: %s", databaseDependency)
+	}
+	if !r.SkipDB && r.DatabaseMode == "bundled" {
+		bootstrap := &PostgresBootstrapRunner{Paths: r.Paths, FS: r.FS, Exec: r.Exec, Systemd: r.Systemd, DBHost: r.DBHost, DBPort: r.DBPort, DBUser: r.DBUser}
+		if _, err := bootstrap.bundledPreflight(); err != nil {
+			return err
+		}
+	}
+	if !r.SkipDB && r.DatabaseMode == "external" {
+		cfg, err := resolveDBConfig(env)
+		if err != nil {
+			return err
+		}
+		if err := configureDBConnector(r.DB, r.Paths, r.FS, cfg); err != nil {
+			return err
+		}
+		if err := r.DB.TestConnection(cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName); err != nil {
+			return err
+		}
+		if err := checkPostgresServer(r.Exec, r.Paths, r.FS, cfg); err != nil {
+			return err
+		}
+	}
+	var proxy *caddyUpdate
+	if !r.SkipTLS && r.ProxyMode == "bundled" {
+		proxy, err = r.prepareBundledCaddy(env)
+		if err != nil {
+			return err
+		}
+		if r.TLSMode == "custom" {
+			env["HEIMDALL_TLS_CERT"] = r.Paths.ConfigDir + "/caddy/certs/server.crt"
+			env["HEIMDALL_TLS_KEY"] = r.Paths.ConfigDir + "/caddy/certs/server.key"
+		}
+	}
+	var previousPG []savedFile
+	pgWasActive, pgWasEnabled := false, false
+	if !r.SkipDB && r.DatabaseMode == "bundled" {
+		pgWasActive, err = r.Systemd.IsActive(bundledPGService)
+		if err != nil {
+			return err
+		}
+		state, err := r.Systemd.ShowProperty(bundledPGService, "UnitFileState")
+		if err != nil {
+			return err
+		}
+		pgWasEnabled = state == "enabled" || state == "enabled-runtime"
+		if r.FS.Exists(bundledPGData + "/PG_VERSION") {
+			for _, file := range []string{"postgresql.conf", "heimdall.conf", "pg_hba.conf"} {
+				snapshot, err := snapshotFile(r.FS, bundledPGData+"/"+file)
+				if err != nil {
+					return err
+				}
+				previousPG = append(previousPG, snapshot)
+			}
+		}
+	}
+	pgChanged := false
+	var disabled []struct {
+		unit            string
+		active, enabled bool
+	}
+	wrote, dependencyChanged := false, false
+	defer func() {
+		if err == nil {
+			return
+		}
+		var rollback []error
+		if proxy != nil {
+			rollback = append(rollback, proxy.rollback())
+		}
+		if pgChanged && (existing["HEIMDALL_DATABASE_MODE"] == "bundled" || dependency.exists) && existing["DATABASE_USERNAME"] == r.DBUser && existing["DATABASE_PASSWORD"] != "" && existing["DATABASE_PASSWORD"] != r.DBPassword {
+			previous := &PostgresBootstrapRunner{Paths: r.Paths, Exec: r.Exec, DBPort: r.DBPort, DBUser: r.DBUser, DBPassword: existing["DATABASE_PASSWORD"]}
+			install := &pgInstall{PsqlBin: r.Paths.RuntimePath("postgresql", "bin", "psql"), SocketDir: bundledPGSocket, OSUser: "heimdall-postgres"}
+			if readyErr := previous.waitReady(install); readyErr != nil {
+				rollback = append(rollback, readyErr)
+			} else {
+				rollback = append(rollback, previous.configureRole(install))
+			}
+		}
+		if pgChanged {
+			for _, saved := range previousPG {
+				rollback = append(rollback, saved.restore(r.FS))
+			}
+			if pgWasActive {
+				rollback = append(rollback, r.Systemd.Restart(bundledPGService))
+			} else {
+				rollback = append(rollback, r.Systemd.Stop(bundledPGService))
+			}
+		}
+
+		if pgChanged && !pgWasEnabled {
+			rollback = append(rollback, runChecked(r.Exec, "systemctl", "disable", bundledPGService))
+		}
+		if wrote {
+			rollback = append(rollback, r.Env.WriteEnvFile(existing))
+			if _, fileBacked := r.Env.(*FileEnvManager); fileBacked {
+				rollback = append(rollback, before.restore(r.FS))
+			}
+		}
+		if dependencyChanged {
+			rollback = append(rollback, dependency.restore(r.FS), runChecked(r.Exec, "systemctl", "daemon-reload"))
+		}
+		for _, unit := range disabled {
+			if unit.enabled {
+				rollback = append(rollback, r.Systemd.Enable(unit.unit))
+			}
+			if unit.active {
+				rollback = append(rollback, r.Systemd.Start(unit.unit))
+			}
+		}
+
+		err = errors.Join(append([]error{err}, rollback...)...)
+	}()
+	r.printSummary(r.DatabaseMode == "bundled")
+	if !r.SkipDB {
+		if err := r.Systemd.Stop(ServiceName); err != nil {
+			return err
+		}
+	}
+	wrote = true
+	if err := r.Env.WriteEnvFile(env); err != nil {
+		return err
+	}
+	if err := runChecked(r.Exec, "chown", "root:heimdall", r.Env.GetEnvFilePath()); err != nil {
+		return err
+	}
+	if err := runChecked(r.Exec, "chmod", "0640", r.Env.GetEnvFilePath()); err != nil {
+		return err
+	}
+	if !r.SkipDB {
+		if r.DatabaseMode == "bundled" {
+			pgChanged = true
+			if err := r.stepPostgresBootstrap(); err != nil {
+				return err
+			}
+			if err := r.stepConnectionTest(); err != nil {
+				return err
+			}
+		}
+		if err := r.stepMigrations(); err != nil {
+			return err
+		}
+		if r.DatabaseMode == "bundled" {
+			if err := r.FS.MkdirAll(filepath.Dir(databaseDependency), 0755); err != nil {
+				return err
+			}
+			dependencyChanged = true
+			if err := r.FS.WriteFile(databaseDependency, []byte(databaseDependencyContent), 0644); err != nil {
+				return err
+			}
+		} else if dependency.exists {
+			dependencyChanged = true
+			if err := r.FS.RemoveAll(databaseDependency); err != nil {
+				return err
+			}
+		}
+		if dependencyChanged {
+			if err := runChecked(r.Exec, "systemctl", "daemon-reload"); err != nil {
+				return err
+			}
+		}
+	}
+	if proxy != nil {
+		if err := proxy.apply(); err != nil {
+			return err
+		}
+		if r.TLSMode == "internal" {
+			fmt.Fprintln(r.Out, "  Import the private Caddy CA where needed:", bundledCaddyRoot)
+		}
+	}
+	// Both selected replacements are now validated and active. Retain old state.
+	for _, selection := range []struct {
+		skip            bool
+		mode, key, unit string
+	}{
+		{r.SkipDB, r.DatabaseMode, "HEIMDALL_DATABASE_MODE", bundledPGService},
+		{r.SkipTLS, r.ProxyMode, "HEIMDALL_PROXY_MODE", bundledCaddyService},
+	} {
+		if selection.skip || selection.mode == "bundled" {
+			continue
+		}
+		active, err := r.Systemd.IsActive(selection.unit)
+		if err != nil {
+			return err
+		}
+		if existing[selection.key] == "bundled" || active || (selection.unit == bundledPGService && dependency.exists) {
+			state, err := r.Systemd.ShowProperty(selection.unit, "UnitFileState")
+			if err != nil {
+				return err
+			}
+			disabled = append(disabled, struct {
+				unit            string
+				active, enabled bool
+			}{selection.unit, active, state == "enabled" || state == "enabled-runtime"})
+			if err := runChecked(r.Exec, "systemctl", "disable", "--now", selection.unit); err != nil {
+				return err
+			}
+		}
+	}
+	if r.ProxyMode != "bundled" {
+		fmt.Fprintf(r.Out, "  Backend address: http://127.0.0.1:%s\n", envDefault(env, "PORT", DefaultAppPort))
+	}
+	r.stepSecurityPolicies()
+	if err := r.stepStartService(); err != nil {
+		return err
+	}
+	r.printCompletionBanner()
+	return nil
+}
+
+func validatePublicURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || (u.Path != "" && u.Path != "/") || u.Hostname() == "" {
+		return nil, fmt.Errorf("EXTERNAL_URL must be an http/https URL without credentials, query, fragment or path")
+	}
+	if net.ParseIP(u.Hostname()) == nil {
+		if err := validateHostname(u.Hostname()); err != nil {
+			return nil, err
+		}
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return nil, fmt.Errorf("EXTERNAL_URL has an empty port")
+	}
+	if raw := u.Port(); raw != "" {
+		p, err := strconv.Atoi(raw)
+		if err != nil || p < 1 || p > 65535 {
+			return nil, fmt.Errorf("EXTERNAL_URL has an invalid port")
+		}
+	}
+	return u, nil
 }

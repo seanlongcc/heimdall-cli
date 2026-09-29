@@ -36,6 +36,9 @@ type FileSystem interface {
 	ReadFile(path string) ([]byte, error)
 	WriteFile(path string, data []byte, perm os.FileMode) error
 	Stat(path string) (os.FileInfo, error)
+	Lstat(path string) (os.FileInfo, error)
+	ReadDir(path string) ([]os.DirEntry, error)
+	Rename(old, new string) error
 	CopyFile(src, dst string) error
 	MkdirAll(path string, perm os.FileMode) error
 	TempDir(prefix string) (string, error)

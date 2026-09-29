@@ -81,7 +81,7 @@ func TestFunctional_Version(t *testing.T) {
 func TestFunctional_Help(t *testing.T) {
 	out, code := run("--help")
 	assert.Equal(t, 0, code)
-	assert.Contains(t, out, "Admin tool for Heimdall")
+	assert.Contains(t, out, "administration tool for Heimdall")
 	assert.Contains(t, out, "backup")
 	assert.Contains(t, out, "status")
 }
@@ -97,7 +97,7 @@ func TestFunctional_SubcommandHelp(t *testing.T) {
 		{"restore", "Restore"},
 		{"config", "View or modify"},
 		{"setup", "orchestrates"},
-		{"status", "service state"},
+		{"status", "status report"},
 		{"start", "Start"},
 		{"stop", "Stop"},
 		{"restart", "Restart"},

@@ -9,6 +9,7 @@ import (
 
 // ConfigRunner implements the config get/set/list subcommands.
 type ConfigRunner struct {
+	Port      *SetPortRunner
 	Env       EnvManager
 	Out       io.Writer
 	ErrOut    io.Writer
@@ -17,8 +18,10 @@ type ConfigRunner struct {
 
 // NewConfigCmd creates the "config" command with get/set/list subcommands.
 func NewConfigCmd(runner *ConfigRunner) *cobra.Command {
+	production := runner == nil
 	if runner == nil {
 		runner = &ConfigRunner{
+			Port:      &SetPortRunner{Exec: &execRunner{}, Systemd: &systemdRunner{}, FS: &osFileSystem{}, Paths: DefaultPaths()},
 			Env:       NewFileEnvManager(),
 			CheckRoot: requireRoot,
 		}
@@ -35,7 +38,8 @@ The 'get' subcommand retrieves the current value of a specific key, masking
 secrets automatically. The 'set' subcommand updates a key after validating
 its value, and requires root privileges since it writes to backend.env.
 
-Changes made with 'config set' require a service restart to take effect.`,
+PORT changes restart the app and update its selected proxy automatically. Other
+changes made with 'config set' require a service restart to take effect.`,
 		Example: `  # List all known configuration keys with descriptions
   sudo heimdall-cli config list
 
@@ -52,6 +56,16 @@ Changes made with 'config set' require a service restart to take effect.`,
 	cmd.AddCommand(newConfigListCmd(runner))
 	cmd.AddCommand(newConfigGetCmd(runner))
 	cmd.AddCommand(newConfigSetCmd(runner))
+
+	if production {
+		for _, child := range cmd.Commands() {
+			child.PreRun = func(cmd *cobra.Command, args []string) {
+				paths := commandPaths(cmd)
+				runner.Env = &FileEnvManager{Path: paths.EnvFile}
+				runner.Port.Paths = paths
+			}
+		}
+	}
 
 	return cmd
 }
@@ -167,7 +181,7 @@ func (r *ConfigRunner) Get(key string) error {
 func (r *ConfigRunner) Set(key, value string) error {
 	switch key {
 	case "HEIMDALL_DATABASE_MODE", "HEIMDALL_PROXY_MODE", "HEIMDALL_TLS_MODE", "HEIMDALL_TLS_CERT", "HEIMDALL_TLS_KEY":
-		return fmt.Errorf("change %s through heimdall-cli setup so ownership and configuration are applied together", key)
+		return fmt.Errorf("Use heimdall-cli setup --database-mode or --proxy-mode to change service ownership.")
 	}
 	if r.CheckRoot != nil {
 		if err := r.CheckRoot(); err != nil {
@@ -178,6 +192,13 @@ func (r *ConfigRunner) Set(key, value string) error {
 		return err
 	}
 
+	if key == "PORT" {
+		if r.Port == nil {
+			return fmt.Errorf("PORT changes require the set-port runner")
+		}
+		r.Port.Env, r.Port.Out, r.Port.ErrOut = r.Env, r.Out, r.ErrOut
+		return r.Port.Run(value)
+	}
 	if err := r.Env.WriteEnvKey(key, value); err != nil {
 		return fmt.Errorf("failed to write config: %w", err)
 	}

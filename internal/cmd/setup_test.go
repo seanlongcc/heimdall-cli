@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -1584,6 +1585,7 @@ func TestInteractiveReconfigureDefersConnection(t *testing.T) {
 
 func TestSetupRPMExternalLocalhostTestsAndMigratesWithoutAdministeringServices(t *testing.T) {
 	r, out, _ := newTestSetupRunner()
+	r.Exec.(*FakeExecRunner).Results[r.Paths.RuntimePath("postgresql", "bin", "psql")+" -X"] = FakeExecResult{Stdout: "180006"}
 	fs := r.FS.(*FakeFileSystem)
 	fs.Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
 	fs.Files[r.Paths.RuntimePath("postgresql", "bin", "psql")] = nil
@@ -1681,4 +1683,180 @@ func TestInteractiveRPMResolvedPasswordDefaults(t *testing.T) {
 			require.Zero(t, db.connections)
 		})
 	}
+}
+
+func bundledSetupFixture(t *testing.T) *SetupRunner {
+	t.Helper()
+	r, _, _ := newTestSetupRunner()
+	fs := r.FS.(*FakeFileSystem)
+	fs.Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+	for _, tool := range []string{"psql", "postgres", "initdb", "pg_isready"} {
+		fs.Files[r.Paths.RuntimePath("postgresql", "bin", tool)] = nil
+	}
+	fs.Files[r.Paths.RuntimePath("caddy", "caddy")] = nil
+	fs.Files["/var/lib/heimdall-postgresql/18/data/PG_VERSION"] = []byte("18\n")
+	fs.Files["/var/lib/heimdall-postgresql/18/data/postgresql.conf"] = []byte("# retain\n")
+	fs.Files["/var/lib/heimdall-postgresql/18/data/pg_hba.conf"] = []byte("local all all peer\nhost all all 127.0.0.1/32 scram-sha-256\n")
+	r.Exec.(*FakeExecRunner).Results["runuser -u heimdall-postgres"] = FakeExecResult{Stdout: "SCRAM-SHA-256$hash"}
+	r.Exec.(*FakeExecRunner).Results[r.Paths.RuntimePath("postgresql", "bin", "psql")+" -X"] = FakeExecResult{Stdout: "180006"}
+	r.Env.(*FakeEnvManager).Env = map[string]string{"DATABASE_HOST": "127.0.0.1", "DATABASE_PORT": "55432", "DATABASE_USERNAME": "heimdall", "DATABASE_PASSWORD": "keep-password", "DATABASE_NAME": "prod", "HEIMDALL_DATABASE_MODE": "bundled", "HEIMDALL_PROXY_MODE": "bundled", "HEIMDALL_TLS_MODE": "internal", "EXTERNAL_URL": "https://heimdall.example.test", "PORT": "3210", "JWT_SECRET": "keep-jwt", "API_KEY_SECRET": "keep-api"}
+	return r
+}
+
+func TestBundledSetupPreflightPreservesConfiguration(t *testing.T) {
+	for _, kind := range []string{"major", "occupied", "external connection", "external major", "caddy validation"} {
+		t.Run(kind, func(t *testing.T) {
+			r := bundledSetupFixture(t)
+			before, _ := r.Env.ReadEnv()
+			fs := r.FS.(*FakeFileSystem)
+			exec := r.Exec.(*FakeExecRunner)
+			r.ExternalURL = "https://changed.example.test"
+			switch kind {
+			case "major":
+				fs.Files["/var/lib/heimdall-postgresql/18/data/PG_VERSION"] = []byte("17")
+			case "occupied":
+				exec.Results["ss -H -ltnp sport = :55432"] = FakeExecResult{Stdout: `LISTEN 0 100 127.0.0.1:55432 0.0.0.0:* users:(("other",pid=123,fd=1))`}
+			case "external connection":
+				r.DatabaseMode = "external"
+				r.DB = &FakeDBConnector{ConnErr: fmt.Errorf("unavailable")}
+			case "external major":
+				r.DatabaseMode = "external"
+				exec.Results[r.Paths.RuntimePath("postgresql", "bin", "psql")+" -X"] = FakeExecResult{Stdout: "190001"}
+			case "caddy validation":
+				exec.Results["runuser -u heimdall-caddy"] = FakeExecResult{ExitCode: 1}
+			}
+			require.Error(t, r.Run())
+			require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+			require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
+			for _, call := range exec.Calls {
+				require.False(t, call.Name == "systemctl" && len(call.Args) > 0 && call.Args[0] == "disable")
+				require.NotEqual(t, "heimdall-server-db-setup", call.Name)
+			}
+		})
+	}
+}
+
+func TestBundledSetupPrivateServicesAndDependency(t *testing.T) {
+	r := bundledSetupFixture(t)
+	require.NoError(t, r.Run())
+	fs := r.FS.(*FakeFileSystem)
+	require.Equal(t, "[Unit]\nRequires=heimdall-postgresql.service\nAfter=heimdall-postgresql.service\n", string(fs.Files["/etc/systemd/system/heimdall-server.service.d/database.conf"]))
+	require.Contains(t, string(fs.Files[r.Paths.ConfigDir+"/caddy/Caddyfile"]), "127.0.0.1:3210")
+	require.Contains(t, r.Systemd.(*FakeSystemdRunner).Actions, "start:heimdall-caddy")
+	for _, call := range r.Exec.(*FakeExecRunner).Calls {
+		for _, arg := range call.Args {
+			require.NotContains(t, arg, "/etc/caddy")
+			require.NotContains(t, arg, "/usr/pgsql-")
+		}
+	}
+}
+
+func TestBundledSetupTransitionsAndMigrationFailure(t *testing.T) {
+	for _, target := range []string{"external", "bundled", "migration failure"} {
+		t.Run(target, func(t *testing.T) {
+			r := bundledSetupFixture(t)
+			fs := r.FS.(*FakeFileSystem)
+			sd := r.Systemd.(*FakeSystemdRunner)
+			exec := r.Exec.(*FakeExecRunner)
+			fs.Files[databaseDependency] = []byte(databaseDependencyContent)
+			fs.Files[r.Paths.ConfigDir+"/caddy/Caddyfile"] = []byte("keep old config\n")
+			fs.Files["/var/lib/heimdall-caddy/data/caddy/pki/authorities/local/root.crt"] = []byte("keep CA")
+			sd.ActiveServices[bundledPGService], sd.ActiveServices[bundledCaddyService] = true, true
+			if target == "bundled" {
+				r.Env.(*FakeEnvManager).Env["HEIMDALL_DATABASE_MODE"] = "external"
+				r.Env.(*FakeEnvManager).Env["HEIMDALL_PROXY_MODE"] = "external"
+				r.DatabaseMode = "bundled"
+				r.ProxyMode = "bundled"
+				delete(fs.Files, databaseDependency)
+			} else {
+				r.DatabaseMode = "external"
+				r.ProxyMode = "external"
+			}
+			if target == "migration failure" {
+				exec.Results["heimdall-server-db-setup"] = FakeExecResult{ExitCode: 1}
+			}
+			before, _ := r.Env.ReadEnv()
+			err := r.Run()
+			if target == "migration failure" {
+				require.Error(t, err)
+				require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+				require.NotContains(t, sd.Actions, "restart:"+ServiceName)
+			} else {
+				require.NoError(t, err)
+			}
+			disabled := []string{}
+			for _, c := range exec.Calls {
+				if c.Name == "systemctl" && len(c.Args) == 3 && c.Args[0] == "disable" {
+					disabled = append(disabled, c.Args[2])
+				}
+			}
+			if target == "external" {
+				require.ElementsMatch(t, []string{bundledPGService, bundledCaddyService}, disabled)
+				require.NotContains(t, fs.Files, databaseDependency)
+			} else {
+				require.Empty(t, disabled)
+			}
+			require.Equal(t, "keep CA", string(fs.Files["/var/lib/heimdall-caddy/data/caddy/pki/authorities/local/root.crt"]))
+		})
+	}
+}
+
+func TestBundledSetupFailedPortChangeRestoresPostgresConfig(t *testing.T) {
+	r := bundledSetupFixture(t)
+	fs := r.FS.(*FakeFileSystem)
+	sd := r.Systemd.(*FakeSystemdRunner)
+	fs.Files[bundledPGData+"/heimdall.conf"] = []byte("port = 55432\n")
+	sd.ActiveServices[bundledPGService] = true
+	r.DBPort = 55555
+	r.flagChanged = map[string]bool{"db-port": true}
+	r.Exec.(*FakeExecRunner).Results["heimdall-server-db-setup"] = FakeExecResult{ExitCode: 1}
+	require.Error(t, r.Run())
+	require.Equal(t, "55432", r.Env.(*FakeEnvManager).Env["DATABASE_PORT"])
+	require.Equal(t, "port = 55432\n", string(fs.Files[bundledPGData+"/heimdall.conf"]))
+}
+
+func TestBundledSetupInvalidExternalProxyKeepsOwnedService(t *testing.T) {
+	r := bundledSetupFixture(t)
+	r.ProxyMode = "external"
+	r.ExternalURL = "file:///invalid"
+	r.SkipDB = true
+	before, _ := r.Env.ReadEnv()
+	require.Error(t, r.Run())
+	require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+	require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
+}
+
+func TestBundledFailedTransitionKeepsPreviouslyStoppedUnitsStopped(t *testing.T) {
+	r := bundledSetupFixture(t)
+	r.DatabaseMode = "external"
+	r.ProxyMode = "external"
+	sd := r.Systemd.(*FakeSystemdRunner)
+	sd.Properties[bundledPGService+":UnitFileState"] = "enabled"
+	sd.Properties[bundledCaddyService+":UnitFileState"] = "enabled"
+	r.Systemd = &portFailureSystemd{FakeSystemdRunner: sd, failure: "restart"}
+	require.Error(t, r.Run())
+	require.False(t, sd.ActiveServices[bundledPGService])
+	require.False(t, sd.ActiveServices[bundledCaddyService])
+}
+
+func TestBundledFailedSetupRestoresPreviousRolePassword(t *testing.T) {
+	r := bundledSetupFixture(t)
+	r.DBPassword = "new-password"
+	r.flagChanged = map[string]bool{"db-password": true}
+	sd := r.Systemd.(*FakeSystemdRunner)
+	sd.ActiveServices[bundledPGService] = true
+	exec := r.Exec.(*FakeExecRunner)
+	exec.Results["heimdall-server-db-setup"] = FakeExecResult{ExitCode: 1}
+	require.Error(t, r.Run())
+	passwords := []string{}
+	for _, call := range exec.Calls {
+		if call.Stdin == roleSetupSQL {
+			for _, arg := range call.Args {
+				if strings.HasPrefix(arg, "db_pass=") {
+					passwords = append(passwords, arg)
+				}
+			}
+		}
+	}
+	require.Equal(t, []string{"db_pass=new-password", "db_pass=keep-password"}, passwords)
 }

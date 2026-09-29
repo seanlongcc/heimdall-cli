@@ -736,3 +736,142 @@ func TestPostgresBootstrap_DetectPG_RealPathLookup(t *testing.T) {
 	_, err = r.detectPG()
 	require.ErrorContains(t, err, "psql not found")
 }
+
+func TestBundledPostgresNeverUsesSystemSocket(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.DatabaseMode = "bundled"
+	r.DBHost, r.DBPort = "127.0.0.1", 55432
+	r.DBUser, r.DBPassword, r.DBName = "heimdall", "test-only-password", "heimdall_test"
+	fs := r.FS.(*FakeFileSystem)
+	fs.Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+	for _, tool := range []string{"psql", "postgres", "initdb", "pg_isready"} {
+		fs.Files[r.Paths.RuntimePath("postgresql", "bin", tool)] = nil
+	}
+	fs.Files["/var/lib/heimdall-postgresql/18/data/PG_VERSION"] = []byte("18\n")
+	fs.Files["/var/lib/heimdall-postgresql/18/data/postgresql.conf"] = []byte("# preserve this\n")
+	fs.Files["/var/lib/heimdall-postgresql/18/data/pg_hba.conf"] = []byte("local all all peer\nhost all all 127.0.0.1/32 scram-sha-256\n")
+	r.Exec.(*FakeExecRunner).Results["runuser -u heimdall-postgres"] = FakeExecResult{Stdout: "SCRAM-SHA-256$hash"}
+	require.NoError(t, r.stepPostgresBootstrap())
+	count := 0
+	for _, call := range r.Exec.(*FakeExecRunner).Calls {
+		if call.Name == "runuser" && strings.Contains(strings.Join(call.Args, " "), "/bin/psql") {
+			count++
+			joined := strings.Join(call.Args, " ")
+			for _, want := range []string{"-u heimdall-postgres --", "-h /run/heimdall-postgresql", "-p 55432", "-U heimdall-postgres"} {
+				require.Contains(t, joined, want)
+			}
+			require.NotContains(t, joined, "/usr/pgsql-")
+		}
+	}
+	require.Equal(t, 3, count)
+	require.Contains(t, r.Systemd.(*FakeSystemdRunner).Actions, "start:heimdall-postgresql")
+}
+
+func TestBundledPostgresPreflightAndFailures(t *testing.T) {
+	for _, failure := range []string{"major", "nonempty", "remote", "port", "initdb", "enable", "sql", "missing runtime", "unexpected path"} {
+		t.Run(failure, func(t *testing.T) {
+			setup := bundledSetupFixture(t)
+			_, err := setup.readConfiguration()
+			require.NoError(t, err)
+			fs := setup.FS.(*FakeFileSystem)
+			exec := setup.Exec.(*FakeExecRunner)
+			sd := setup.Systemd.(*FakeSystemdRunner)
+			switch failure {
+			case "major":
+				fs.Files[bundledPGData+"/PG_VERSION"] = []byte("17")
+			case "nonempty":
+				delete(fs.Files, bundledPGData+"/PG_VERSION")
+			case "remote":
+				setup.DBHost = "elsewhere.test"
+			case "port":
+				setup.DBPort = 65536
+			case "initdb":
+				for path := range fs.Files {
+					if strings.HasPrefix(path, bundledPGData+"/") {
+						delete(fs.Files, path)
+					}
+				}
+				exec.Results["runuser -u heimdall-postgres"] = FakeExecResult{ExitCode: 1}
+			case "enable":
+				sd.Err = fmt.Errorf("enable refused")
+			case "sql":
+				exec.Results["runuser -u heimdall-postgres"] = FakeExecResult{ExitCode: 1}
+			case "missing runtime":
+				delete(fs.Files, setup.Paths.RuntimePath("postgresql", "bin", "postgres"))
+			case "unexpected path":
+				fs.Files["/var/lib/heimdall-postgresql"] = []byte("not directory")
+			}
+			before := map[string]string{}
+			for path, data := range fs.Files {
+				before[path] = string(data)
+			}
+			require.Error(t, setup.stepPostgresBootstrap())
+			require.NotContains(t, setup.Out.(*bytes.Buffer).String(), "bootstrap complete")
+			if failure != "initdb" && failure != "enable" && failure != "sql" {
+				require.Empty(t, sd.Actions)
+				after := map[string]string{}
+				for path, data := range fs.Files {
+					after[path] = string(data)
+				}
+				require.Equal(t, before, after)
+			}
+		})
+	}
+}
+
+func TestBundledPostgresExternalLocalhostNeverBootstraps(t *testing.T) {
+	r, exec, fs, sd, _ := newBootstrapForTest()
+	r.DatabaseMode = "external"
+	r.DBHost = "localhost"
+	require.NoError(t, r.Run())
+	require.Empty(t, exec.Calls)
+	require.Empty(t, sd.Actions)
+	require.Empty(t, fs.Files)
+}
+
+func TestBundledPortChecksOwnershipAtRequestedListener(t *testing.T) {
+	for _, tc := range []struct {
+		name, output, pid string
+		active            bool
+		fail              bool
+	}{
+		{"free", "", "", false, false},
+		{"own", `LISTEN 0 100 127.0.0.1:55432 0.0.0.0:* users:(("postgres",pid=123,fd=1))`, "123", true, false},
+		{"other pid", `LISTEN 0 100 127.0.0.1:55432 0.0.0.0:* users:(("postgres",pid=123,fd=1))`, "456", true, true},
+		{"same unit wrong port", `LISTEN 0 100 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=123,fd=1))`, "123", true, true},
+		{"unknown owner", `LISTEN 0 100 127.0.0.1:55432 0.0.0.0:*`, "123", true, true},
+		{"inactive", `LISTEN 0 100 127.0.0.1:55432 0.0.0.0:* users:(("postgres",pid=123,fd=1))`, "123", false, true},
+		{"malformed", "garbage", "123", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &FakeExecRunner{Results: map[string]FakeExecResult{"ss -H": {Stdout: tc.output}}}
+			sd := &FakeSystemdRunner{ActiveServices: map[string]bool{bundledPGService: tc.active}, Properties: map[string]string{bundledPGService + ":MainPID": tc.pid}}
+			err := checkOwnedPort(exec, sd, 55432, bundledPGService, false)
+			if tc.fail {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Empty(t, sd.Actions)
+		})
+	}
+}
+
+func TestBundledPostgresRerunPreservesSettingsWithoutDuplicates(t *testing.T) {
+	r := bundledSetupFixture(t)
+	_, err := r.readConfiguration()
+	require.NoError(t, err)
+	fs := r.FS.(*FakeFileSystem)
+	fs.Files[bundledPGData+"/postgresql.conf"] = []byte("shared_buffers = '256MB'\ninclude = 'heimdall.conf'\nport = 1234\n")
+	require.NoError(t, r.stepPostgresBootstrap())
+	require.NoError(t, r.stepPostgresBootstrap())
+	content := string(fs.Files[bundledPGData+"/postgresql.conf"])
+	require.Contains(t, content, "shared_buffers = '256MB'")
+	require.Equal(t, 1, strings.Count(content, "include = 'heimdall.conf'"))
+	require.True(t, strings.HasSuffix(content, "include = 'heimdall.conf'\n"))
+	require.Equal(t, 1, strings.Count(string(fs.Files[bundledPGData+"/pg_hba.conf"]), "host all all 127.0.0.1/32 scram-sha-256"))
+	fs.Files[bundledPGData+"/postgresql.auto.conf"] = []byte("listen_addresses = '*'\n")
+	actions := len(r.Systemd.(*FakeSystemdRunner).Actions)
+	require.ErrorContains(t, r.stepPostgresBootstrap(), "remove the listen_addresses override")
+	require.Len(t, r.Systemd.(*FakeSystemdRunner).Actions, actions)
+}

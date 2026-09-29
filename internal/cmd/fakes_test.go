@@ -263,6 +263,9 @@ func (f *FakeFileSystem) Stat(path string) (os.FileInfo, error) {
 	if data, ok := f.Files[path]; ok {
 		return &fakeFileInfo{name: filepath.Base(path), size: int64(len(data))}, nil
 	}
+	if f.Dirs[path] {
+		return &fakeFileInfo{name: filepath.Base(path), mode: os.ModeDir}, nil
+	}
 	return nil, os.ErrNotExist
 }
 
@@ -270,13 +273,14 @@ func (f *FakeFileSystem) Stat(path string) (os.FileInfo, error) {
 type fakeFileInfo struct {
 	name string
 	size int64
+	mode os.FileMode
 }
 
 func (fi *fakeFileInfo) Name() string       { return fi.name }
 func (fi *fakeFileInfo) Size() int64        { return fi.size }
-func (fi *fakeFileInfo) Mode() os.FileMode  { return 0640 }
+func (fi *fakeFileInfo) Mode() os.FileMode  { return 0640 | fi.mode }
 func (fi *fakeFileInfo) ModTime() time.Time { return time.Time{} }
-func (fi *fakeFileInfo) IsDir() bool        { return false }
+func (fi *fakeFileInfo) IsDir() bool        { return fi.mode.IsDir() }
 func (fi *fakeFileInfo) Sys() interface{}   { return nil }
 func (f *FakeFileSystem) CopyFile(src, dst string) error {
 	data, ok := f.Files[src]
@@ -440,4 +444,35 @@ func (f *FakeDBConnector) TestConnection(host string, port int, user, password, 
 
 func (f *FakeDBConnector) TableCount(host string, port int, user, password, dbName string) (int, error) {
 	return f.Tables, f.TableErr
+}
+
+func (f *FakeFileSystem) Lstat(path string) (os.FileInfo, error) { return f.Stat(path) }
+func (f *FakeFileSystem) ReadDir(path string) ([]os.DirEntry, error) {
+	var entries []os.DirEntry
+	for name := range f.Files {
+		if filepath.Dir(name) == path {
+			info, _ := f.Stat(name)
+			entries = append(entries, fakeDirEntry{info})
+		}
+	}
+	for name := range f.Dirs {
+		if filepath.Dir(name) == path {
+			entries = append(entries, fakeDirEntry{&fakeFileInfo{name: filepath.Base(name), mode: os.ModeDir}})
+		}
+	}
+	return entries, nil
+}
+
+type fakeDirEntry struct{ os.FileInfo }
+
+func (d fakeDirEntry) Type() os.FileMode          { return d.Mode().Type() }
+func (d fakeDirEntry) Info() (os.FileInfo, error) { return d.FileInfo, nil }
+func (f *FakeFileSystem) Rename(old, new string) error {
+	data, err := f.ReadFile(old)
+	if err != nil {
+		return err
+	}
+	f.Files[new] = data
+	delete(f.Files, old)
+	return nil
 }

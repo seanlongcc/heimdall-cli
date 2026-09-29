@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -10,6 +11,8 @@ import (
 
 // SetPortRunner holds dependencies for the set-port command.
 type SetPortRunner struct {
+	FS        FileSystem
+	Paths     Paths
 	Exec      ExecRunner
 	Env       EnvManager
 	Systemd   SystemdRunner
@@ -19,11 +22,17 @@ type SetPortRunner struct {
 }
 
 // Run executes the set-port logic.
-func (r *SetPortRunner) Run(portStr string) error {
+func (r *SetPortRunner) Run(portStr string) (err error) {
 	if r.CheckRoot != nil {
 		if err := r.CheckRoot(); err != nil {
 			return err
 		}
+	}
+	if r.FS == nil {
+		r.FS = &osFileSystem{}
+	}
+	if r.Paths.AppDir == "" {
+		r.Paths = DefaultPaths()
 	}
 	p, err := strconv.Atoi(portStr)
 	if err != nil || p < 1 || p > 65535 {
@@ -39,6 +48,54 @@ func (r *SetPortRunner) Run(portStr string) error {
 		oldPort = DefaultAppPort
 	}
 
+	bundled, err := r.Paths.hasRuntime(r.FS)
+	if err != nil {
+		return err
+	}
+	var proxy *caddyUpdate
+	var before savedFile
+	if bundled {
+		before, err = snapshotFile(r.FS, r.Env.GetEnvFilePath())
+		if err != nil {
+			return err
+		}
+		if err := checkOwnedPort(r.Exec, r.Systemd, p, ServiceName, false); err != nil {
+			return err
+		}
+		if env["HEIMDALL_PROXY_MODE"] == "bundled" {
+			candidate := make(map[string]string, len(env))
+			for key, value := range env {
+				candidate[key] = value
+			}
+			candidate["PORT"] = portStr
+			setup := &SetupRunner{Paths: r.Paths, Exec: r.Exec, FS: r.FS, Systemd: r.Systemd, Env: r.Env, Out: r.Out}
+			proxy, err = setup.prepareBundledCaddy(candidate)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	wrote, restarted := false, false
+	defer func() {
+		if err == nil || !wrote {
+			return
+		}
+		var rollback []error
+		rollback = append(rollback, r.Env.WriteEnvFile(env))
+		if bundled {
+			if _, ok := r.Env.(*FileEnvManager); ok {
+				rollback = append(rollback, before.restore(r.FS))
+			}
+		}
+		if proxy != nil {
+			rollback = append(rollback, proxy.rollback())
+		}
+		if restarted {
+			rollback = append(rollback, r.Systemd.Restart(ServiceName))
+		}
+		err = errors.Join(append([]error{err}, rollback...)...)
+	}()
+	wrote = true
 	if err := r.Env.WriteEnvKey("PORT", portStr); err != nil {
 		return fmt.Errorf("failed to update env: %w", err)
 	}
@@ -57,8 +114,17 @@ func (r *SetPortRunner) Run(portStr string) error {
 	// Restart
 	fmt.Fprintln(r.Out)
 	fmt.Fprintln(r.Out, "Restarting service...")
+	restarted = true
 	if err := r.Systemd.Restart(ServiceName); err != nil {
 		return fmt.Errorf("failed to restart service: %w", err)
+	}
+	if proxy != nil {
+		if err := proxy.apply(); err != nil {
+			return err
+		}
+	}
+	if bundled && env["HEIMDALL_PROXY_MODE"] == "external" {
+		fmt.Fprintf(r.Out, "Backend address: http://127.0.0.1:%s\n", portStr)
 	}
 	fmt.Fprintf(r.Out, "Done. Heimdall now listening on port %s.\n", portStr)
 
@@ -67,8 +133,10 @@ func (r *SetPortRunner) Run(portStr string) error {
 
 // NewSetPortCmd creates the set-port command.
 func NewSetPortCmd(runner *SetPortRunner) *cobra.Command {
+	production := runner == nil
 	if runner == nil {
 		runner = &SetPortRunner{
+			FS: &osFileSystem{}, Paths: DefaultPaths(),
 			Exec:      &execRunner{},
 			Env:       NewFileEnvManager(),
 			Systemd:   &systemdRunner{},
@@ -95,6 +163,10 @@ The port must be between 1 and 65535. Requires root privileges.`,
   sudo heimdall-cli set-port 9000`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if production {
+				runner.Paths = commandPaths(cmd)
+				runner.Env = &FileEnvManager{Path: runner.Paths.EnvFile}
+			}
 			initIO(&runner.Out, &runner.ErrOut, cmd)
 			return runner.Run(args[0])
 		},

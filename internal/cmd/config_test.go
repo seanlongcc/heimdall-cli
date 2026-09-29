@@ -3,6 +3,8 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -99,6 +101,8 @@ func TestConfigSet_UpdatesEnvFile(t *testing.T) {
 		Out:    new(bytes.Buffer),
 		ErrOut: new(bytes.Buffer),
 	}
+	port, _, _, _, _ := newSetPortRunner()
+	r.Port = port
 	err := r.Set("PORT", "8080")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -107,11 +111,11 @@ func TestConfigSet_UpdatesEnvFile(t *testing.T) {
 		t.Errorf("expected PORT=8080, got: %s", env.Env["PORT"])
 	}
 	out := r.Out.(*bytes.Buffer).String()
-	if !strings.Contains(out, "Set PORT=8080") {
+	if !strings.Contains(out, "PORT=8080") {
 		t.Errorf("expected confirmation message, got: %s", out)
 	}
-	if !strings.Contains(out, "Restart to apply") {
-		t.Errorf("expected restart reminder, got: %s", out)
+	if !strings.Contains(out, "Restarting service") {
+		t.Errorf("expected applied port change, got: %s", out)
 	}
 }
 
@@ -255,4 +259,13 @@ func TestConfigSetRejectsDeploymentChanges(t *testing.T) {
 		require.ErrorContains(t, err, "setup")
 		require.Equal(t, "keep", env.Env[key])
 	}
+}
+
+func TestConfigRootPathOverrides(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "backend.env")
+	require.NoError(t, os.WriteFile(path, []byte("PORT=3210\n"), 0600))
+	out, _, err := executeCommand(t, "--env-file", path, "config", "get", "PORT")
+	require.NoError(t, err)
+	require.Contains(t, out, "PORT=3210")
 }

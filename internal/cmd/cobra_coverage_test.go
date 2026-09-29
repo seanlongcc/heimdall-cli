@@ -39,9 +39,11 @@ func TestConfigGetCmd_ViaCobra(t *testing.T) {
 }
 
 func TestConfigSetCmd_ViaCobra(t *testing.T) {
+	port, _, _, _, _ := newSetPortRunner()
 	env := &FakeEnvManager{Env: map[string]string{}}
 	r := &ConfigRunner{
 		Env:       env,
+		Port:      port,
 		CheckRoot: func() error { return nil },
 	}
 	cmd := NewConfigCmd(r)
@@ -51,7 +53,7 @@ func TestConfigSetCmd_ViaCobra(t *testing.T) {
 	err := cmd.Execute()
 	require.NoError(t, err)
 	assert.Equal(t, "8080", env.Env["PORT"])
-	assert.Contains(t, out.String(), "Set PORT=8080")
+	assert.Contains(t, out.String(), "PORT=8080")
 }
 
 func TestStartCmd_ViaCobra(t *testing.T) {
@@ -123,9 +125,9 @@ func TestDiagCmd_ViaCobra(t *testing.T) {
 	r := newDefaultServiceRunner(nil, nil)
 	r.Exec = &FakeExecRunner{Results: map[string]FakeExecResult{
 		"cat /etc/os-release": {Stdout: "NAME=TestOS\n"},
-		"uname -rm":          {Stdout: "5.14.0 x86_64"},
-		"free -h":            {Stdout: "Mem: 16Gi"},
-		"ss -tlnp":           {Stdout: "LISTEN 0 128 *:3000"},
+		"uname -rm":           {Stdout: "5.14.0 x86_64"},
+		"free -h":             {Stdout: "Mem: 16Gi"},
+		"ss -tlnp":            {Stdout: "LISTEN 0 128 *:3000"},
 	}}
 	r.Systemd = &FakeSystemdRunner{ActiveServices: make(map[string]bool), Properties: make(map[string]string)}
 	r.CheckRoot = func() error { return nil }

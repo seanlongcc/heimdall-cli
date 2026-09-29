@@ -98,7 +98,10 @@ func (r *osFileSystem) ReadFile(path string) ([]byte, error) { return os.ReadFil
 func (r *osFileSystem) WriteFile(path string, data []byte, perm os.FileMode) error {
 	return os.WriteFile(path, data, perm)
 }
-func (r *osFileSystem) Stat(path string) (os.FileInfo, error) { return os.Stat(path) }
+func (r *osFileSystem) Lstat(path string) (os.FileInfo, error)     { return os.Lstat(path) }
+func (r *osFileSystem) ReadDir(path string) ([]os.DirEntry, error) { return os.ReadDir(path) }
+func (r *osFileSystem) Rename(old, new string) error               { return os.Rename(old, new) }
+func (r *osFileSystem) Stat(path string) (os.FileInfo, error)      { return os.Stat(path) }
 func (r *osFileSystem) CopyFile(src, dst string) error {
 	info, err := os.Stat(src)
 	if err != nil {

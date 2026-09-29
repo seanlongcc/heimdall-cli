@@ -98,6 +98,36 @@ func (r *StatusRunner) Run() error {
 		return err
 	}
 	port := envDefault(env, "PORT", DefaultAppPort)
+	runtimes := map[string]string{}
+	if bundledRuntime {
+		data, err := r.FS.ReadFile(r.Paths.AppDir + "/runtime-manifest.json")
+		if err != nil {
+			return err
+		}
+		var manifest struct {
+			Runtimes map[string]struct {
+				Version string `json:"version"`
+			} `json:"runtimes"`
+		}
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return fmt.Errorf("reading runtime inventory: %w", err)
+		}
+		for name, item := range manifest.Runtimes {
+			runtimes[name] = item.Version
+		}
+	}
+	units := map[string]bool{}
+	if bundledRuntime {
+		for _, item := range []struct{ mode, unit string }{{deployment.DatabaseMode, bundledPGService}, {deployment.ProxyMode, bundledCaddyService}} {
+			if item.mode == "bundled" {
+				active, err := r.Systemd.IsActive(item.unit)
+				if err != nil {
+					return err
+				}
+				units[item.unit] = active
+			}
+		}
+	}
 
 	// Version
 	versionData, err := r.FS.ReadFile(r.Paths.AppDir + "/apps/backend/package.json")
@@ -109,10 +139,19 @@ func (r *StatusRunner) Run() error {
 	}
 
 	if r.JSON {
-		return r.runJSON(dbCfg, deployment, version, port)
+		return r.runJSON(dbCfg, deployment, version, port, env["EXTERNAL_URL"], runtimes, units)
 	}
 
 	fmt.Fprintf(r.Out, "Heimdall Server v%s\n", version)
+	if bundledRuntime {
+		for _, name := range []string{"node", "postgresql", "caddy"} {
+			fmt.Fprintf(r.Out, "  Bundled %s: %s\n", name, runtimes[name])
+		}
+		fmt.Fprintf(r.Out, "  Proxy: %s (%s)\n", deployment.ProxyMode, env["EXTERNAL_URL"])
+		if deployment.ProxyMode == "bundled" {
+			fmt.Fprintf(r.Out, "  %s running: %t\n", bundledCaddyService, units[bundledCaddyService])
+		}
+	}
 
 	// Service
 	fmt.Fprintln(r.Out)
@@ -305,7 +344,7 @@ func (r *StatusRunner) Run() error {
 }
 
 // runJSON outputs the status report as structured JSON.
-func (r *StatusRunner) runJSON(dbCfg DBConfig, deployment Deployment, version, port string) error {
+func (r *StatusRunner) runJSON(dbCfg DBConfig, deployment Deployment, version, port, publicURL string, runtimes map[string]string, units map[string]bool) error {
 	active, _ := r.Systemd.IsActive(ServiceName)
 
 	result := map[string]interface{}{
@@ -314,6 +353,13 @@ func (r *StatusRunner) runJSON(dbCfg DBConfig, deployment Deployment, version, p
 		"deployment": map[string]string{"database_mode": deployment.DatabaseMode, "proxy_mode": deployment.ProxyMode, "tls_mode": deployment.TLSMode},
 	}
 
+	result["proxy"] = map[string]string{"mode": deployment.ProxyMode, "url": publicURL, "backend": "http://127.0.0.1:" + port}
+	if len(runtimes) > 0 {
+		result["runtimes"] = runtimes
+	}
+	if len(units) > 0 {
+		result["managed_services"] = units
+	}
 	// Service
 	svc := map[string]interface{}{"running": active}
 	if active {
