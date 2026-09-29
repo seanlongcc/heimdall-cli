@@ -12,6 +12,7 @@ import (
 
 // BackupRunner implements the backup command.
 type BackupRunner struct {
+	Paths     Paths
 	Exec      ExecRunner
 	Env       EnvManager
 	FS        FileSystem
@@ -22,6 +23,7 @@ type BackupRunner struct {
 
 // NewBackupCmd creates the "backup" command.
 func NewBackupCmd(runner *BackupRunner) *cobra.Command {
+	production := runner == nil
 	if runner == nil {
 		runner = &BackupRunner{
 			Exec:      &execRunner{},
@@ -52,7 +54,14 @@ configuration file is archived. Requires root privileges.`,
   # Create a backup before upgrading
   sudo heimdall-cli backup -o /tmp && sudo dnf upgrade heimdall-server`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if production {
+				runner.Paths = commandPaths(cmd)
+				runner.Env = &FileEnvManager{Path: runner.Paths.EnvFile}
+			}
 			initIO(&runner.Out, &runner.ErrOut, cmd)
+			if production && !cmd.Flags().Changed("output") {
+				outputDir = filepath.Join(runner.Paths.DataDir, "backups")
+			}
 			return runner.Run(outputDir)
 		},
 	}
@@ -73,7 +82,14 @@ func (r *BackupRunner) Run(outputDir string) error {
 		return fmt.Errorf("failed to read env: %w", err)
 	}
 
-	dbCfg := ExtractDBConfig(env)
+	dbCfg, err := resolveDBConfig(env)
+	if err != nil {
+		return err
+	}
+	binary, err := postgresClient(r.Paths, r.FS, "pg_dump")
+	if err != nil {
+		return err
+	}
 
 	// Validate output directory to prevent path traversal
 	if !filepath.IsAbs(outputDir) {
@@ -103,7 +119,7 @@ func (r *BackupRunner) Run(outputDir string) error {
 	if dbCfg.Password != "" {
 		dumpFile := filepath.Join(backupDir, "database.sql")
 		pgEnv := dbCfg.PgEnv()
-		_, exitCode, err := r.Exec.RunWithEnv(pgEnv, "pg_dump",
+		_, exitCode, err := r.Exec.RunWithEnv(pgEnv, binary,
 			"-h", dbCfg.Host, "-p", dbCfg.PortStr(), "-U", dbCfg.User, dbCfg.DBName, "-f", dumpFile)
 		if err != nil || exitCode != 0 {
 			fmt.Fprintln(r.ErrOut, "Database: backup FAILED")

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -13,8 +14,8 @@ import (
 // so each test gets a fresh command tree.
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "heimdall-cli",
-		Short:         "Admin tool for Heimdall Server RPM installations",
+		Use:   "heimdall-cli",
+		Short: "Admin tool for Heimdall Server RPM installations",
 		Long: `heimdall-cli is the administration tool for Heimdall Server RPM installations.
 It manages post-install setup, service lifecycle, configuration, backups,
 and diagnostics for Heimdall Enterprise Server on RHEL-family systems.
@@ -89,7 +90,11 @@ FILES:
 
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		cfgFile, _ := cmd.Flags().GetString("config")
-		return initConfig(v, cfgFile)
+		if err := initConfig(v, cfgFile); err != nil {
+			return err
+		}
+		cmd.SetContext(context.WithValue(cmd.Context(), pathsContextKey{}, NewPathsFromViper(v)))
+		return nil
 	}
 
 	// Register all subcommands

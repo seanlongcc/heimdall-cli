@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConfigList_ShowsCategoriesAndKeys(t *testing.T) {
@@ -244,4 +245,14 @@ func TestConfigGet_KeyNotInEnv_ButInSchema(t *testing.T) {
 	assert.Contains(t, err.Error(), "key not found")
 	errOut := r.ErrOut.(*bytes.Buffer).String()
 	assert.Contains(t, errOut, "Description")
+}
+
+func TestConfigSetRejectsDeploymentChanges(t *testing.T) {
+	for _, key := range []string{"HEIMDALL_DATABASE_MODE", "HEIMDALL_PROXY_MODE", "HEIMDALL_TLS_MODE", "HEIMDALL_TLS_CERT", "HEIMDALL_TLS_KEY"} {
+		env := &FakeEnvManager{Env: map[string]string{key: "keep"}}
+		r := &ConfigRunner{Env: env, Out: new(bytes.Buffer), ErrOut: new(bytes.Buffer)}
+		err := r.Set(key, "external")
+		require.ErrorContains(t, err, "setup")
+		require.Equal(t, "keep", env.Env[key])
+	}
 }

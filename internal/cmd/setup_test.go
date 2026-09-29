@@ -626,7 +626,8 @@ func TestInteractive_ExternalDB_ExternalSSL(t *testing.T) {
 	assert.Equal(t, "heimdall_prod", env["DATABASE_NAME"])
 	assert.Equal(t, "https://heimdall.example.com", env["EXTERNAL_URL"])
 	assert.Equal(t, "admin@example.com", env["ADMIN_EMAIL"])
-	assert.True(t, r.SkipTLS, "external SSL should set SkipTLS")
+	assert.Equal(t, "external", r.ProxyMode)
+	assert.False(t, r.SkipTLS, "ownership must not rewrite a temporary skip")
 	// SkipDB stays false — we still want connection test + migrations
 	assert.False(t, r.SkipDB, "external DB should NOT set SkipDB (migrations still needed)")
 	assert.Contains(t, out.String(), "Configuration saved")
@@ -714,7 +715,8 @@ func TestInteractive_LocalDB_NoTLS(t *testing.T) {
 	err := r.stepConfigure()
 	require.NoError(t, err)
 
-	assert.True(t, r.SkipTLS, "no TLS choice should set SkipTLS")
+	assert.Equal(t, "none", r.ProxyMode)
+	assert.False(t, r.SkipTLS, "ownership must not rewrite a temporary skip")
 }
 
 // Test: Re-run with existing config keeps current values
@@ -1148,6 +1150,7 @@ func TestSetupCmd_PrintSummary_SkipTLS(t *testing.T) {
 
 func TestSetupCmd_PrintSummary_RunTLS(t *testing.T) {
 	r, out, _ := newTestSetupRunner()
+	r.ProxyMode = "bundled"
 	r.printSummary(true)
 	output := out.String()
 	assert.Contains(t, output, "TLS reverse proxy:    run")
@@ -1198,9 +1201,9 @@ func TestInteractive_ExternalDB_ConnectivityTestPasses(t *testing.T) {
 		IsTTY: true,
 	}
 
-	err := r.stepConfigure()
+	err := r.Run()
 	require.NoError(t, err)
-	assert.Contains(t, out.String(), "connected")
+	assert.Contains(t, out.String(), "Connected to db.example.com:5432/heimdall")
 }
 
 func TestInteractive_ExternalDB_ConnectivityTestFails(t *testing.T) {
@@ -1226,13 +1229,12 @@ func TestInteractive_ExternalDB_ConnectivityTestFails(t *testing.T) {
 		IsTTY: true,
 	}
 
-	err := r.stepConfigure()
-	require.NoError(t, err)
-	assert.Contains(t, out.String(), "connection refused")
-	assert.Contains(t, out.String(), "continuing without verified connection")
+	err := r.Run()
+	require.ErrorContains(t, err, "connection refused")
+	assert.NotContains(t, out.String(), "Step 4/7")
 }
 
-func TestInteractive_ExternalDB_ConnectivityTestFails_Abort(t *testing.T) {
+func TestInteractive_ExternalDB_ReconfigureSkipsConnection(t *testing.T) {
 	r, _, _ := newTestSetupRunner()
 	r.Interactive = true
 	r.DB.(*FakeDBConnector).ConnErr = fmt.Errorf("connection refused")
@@ -1252,9 +1254,8 @@ func TestInteractive_ExternalDB_ConnectivityTestFails_Abort(t *testing.T) {
 		IsTTY: true,
 	}
 
-	err := r.stepConfigure()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "database connection failed")
+	r.Reconfigure = true
+	require.NoError(t, r.Run())
 }
 
 func TestInteractive_LocalDB_SkipsConnectivityTest(t *testing.T) {
@@ -1399,5 +1400,190 @@ fi
 				require.Equal(t, want, string(data))
 			})
 		}
+	}
+}
+
+func TestSetupRPMChoicesAndDryRun(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		saved                             map[string]string
+		args                              []string
+		database, proxy, host, port, user string
+	}{
+		{"fresh template", map[string]string{"DATABASE_HOST": "localhost", "DATABASE_PORT": "5432", "DATABASE_USERNAME": "postgres"}, nil, "bundled", "bundled", "127.0.0.1", "55432", "heimdall"},
+		{"saved selection", map[string]string{"DATABASE_PASSWORD": "saved", "HEIMDALL_DATABASE_MODE": "bundled", "HEIMDALL_PROXY_MODE": "none", "DATABASE_HOST": "127.0.0.1", "DATABASE_PORT": "55433", "DATABASE_USERNAME": "app"}, nil, "bundled", "none", "127.0.0.1", "55433", "app"},
+		{"legacy localhost", map[string]string{"DATABASE_PASSWORD": "saved", "DATABASE_HOST": "localhost"}, nil, "external", "external", "localhost", "5432", "postgres"},
+		{"explicit defaults win", map[string]string{"DATABASE_PASSWORD": "saved", "HEIMDALL_DATABASE_MODE": "bundled", "HEIMDALL_PROXY_MODE": "bundled", "DATABASE_HOST": "db.internal", "DATABASE_PORT": "55432", "DATABASE_USERNAME": "app", "DATABASE_NAME": "custom"}, []string{"--database-mode=external", "--proxy-mode=external", "--db-host=localhost", "--db-port=5432", "--db-user=postgres", "--db-name=heimdall-server-production"}, "external", "external", "localhost", "5432", "postgres"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, dry := range []bool{false, true} {
+				r, out, _ := newTestSetupRunner()
+				fs := r.FS.(*FakeFileSystem)
+				fs.Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+				r.Env.(*FakeEnvManager).Env = tc.saved
+				before, err := r.Env.ReadEnv()
+				require.NoError(t, err)
+				files := map[string][]byte{}
+				for k, v := range fs.Files {
+					files[k] = append([]byte(nil), v...)
+				}
+				cmd := NewSetupCmd(r)
+				args := append([]string{"--non-interactive", "--reconfigure", "--skip-db", "--skip-tls"}, tc.args...)
+				if dry {
+					args = append(args, "--dry-run")
+				}
+				cmd.SetArgs(args)
+				require.NoError(t, cmd.Execute())
+				if dry {
+					require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+					require.Equal(t, files, fs.Files)
+					require.Empty(t, fs.Dirs)
+					require.Empty(t, r.Exec.(*FakeExecRunner).Calls)
+					require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
+					require.Contains(t, out.String(), tc.host+":"+tc.port)
+					require.Contains(t, out.String(), "Database mode: "+tc.database)
+				} else {
+					env := r.Env.(*FakeEnvManager).Env
+					require.Equal(t, tc.database, env["HEIMDALL_DATABASE_MODE"])
+					require.Equal(t, tc.proxy, env["HEIMDALL_PROXY_MODE"])
+					require.Equal(t, tc.host, env["DATABASE_HOST"])
+					require.Equal(t, tc.port, env["DATABASE_PORT"])
+					require.Equal(t, tc.user, env["DATABASE_USERNAME"])
+					for k, v := range before {
+						if k == "DATABASE_PASSWORD" {
+							require.Equal(t, v, env[k])
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestSetupRPMInvalidModeAndURLConflictHaveNoSideEffects(t *testing.T) {
+	for _, args := range [][]string{{"--database-mode=localhost"}, {"--db-host=other-host"}} {
+		r, _, _ := newTestSetupRunner()
+		r.FS.(*FakeFileSystem).Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+		r.Env.(*FakeEnvManager).Env = map[string]string{"DATABASE_URL": "postgres://app:secret@db.example:6432/prod", "DATABASE_PASSWORD": "secret"}
+		before, _ := r.Env.ReadEnv()
+		cmd := NewSetupCmd(r)
+		cmd.SetArgs(append([]string{"--reconfigure"}, args...))
+		require.Error(t, cmd.Execute())
+		require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+		require.Empty(t, r.Exec.(*FakeExecRunner).Calls)
+		require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
+	}
+}
+
+func TestInteractiveRPMOwnershipAndRerun(t *testing.T) {
+	for _, tc := range []struct {
+		db, proxy         int
+		dbMode, proxyMode string
+	}{{0, 0, "bundled", "bundled"}, {0, 1, "bundled", "external"}, {1, 0, "external", "bundled"}, {1, 1, "external", "external"}} {
+		t.Run(tc.dbMode+"/"+tc.proxyMode, func(t *testing.T) {
+			r, _, _ := newTestSetupRunner()
+			r.FS.(*FakeFileSystem).Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+			r.Interactive = true
+			r.Reconfigure = true
+			r.Prompter = &FakePrompter{IsTTY: true, Selects: map[string]int{"Database setup": tc.db, "TLS/SSL setup": tc.proxy}, Inputs: map[string]string{"Database host": "localhost", "Database port": "5432", "Database user": "externalapp", "Database password": "secret", "Confirm password": "secret"}}
+			r.DB = &recordingDBConnector{}
+			require.NoError(t, r.Run())
+			env := r.Env.(*FakeEnvManager).Env
+			require.Equal(t, tc.dbMode, env["HEIMDALL_DATABASE_MODE"])
+			require.Equal(t, tc.proxyMode, env["HEIMDALL_PROXY_MODE"])
+			require.False(t, r.SkipTLS, "selection is not a temporary skip")
+			require.Zero(t, r.DB.(*recordingDBConnector).connections)
+			if tc.db == 0 {
+				require.Equal(t, "127.0.0.1", env["DATABASE_HOST"])
+				require.Equal(t, "55432", env["DATABASE_PORT"])
+			} else {
+				require.Equal(t, "localhost", env["DATABASE_HOST"])
+			}
+			before, _ := r.Env.ReadEnv()
+			// Enter on rerun must select saved ownership and endpoint defaults.
+			r.Prompter = &FakePrompter{IsTTY: true}
+			require.NoError(t, r.Run())
+			require.Equal(t, before, r.Env.(*FakeEnvManager).Env)
+		})
+	}
+}
+
+type recordingDBConnector struct{ connections int }
+
+func (d *recordingDBConnector) TestConnection(string, int, string, string, string) error {
+	d.connections++
+	return nil
+}
+func (d *recordingDBConnector) TableCount(string, int, string, string, string) (int, error) {
+	return 7, nil
+}
+
+func TestInteractiveReconfigureDefersConnection(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Reconfigure = true
+	r.Prompter = &FakePrompter{IsTTY: true, Selects: map[string]int{"Database setup": 1, "TLS/SSL setup": 1}, Inputs: map[string]string{"Database host": "localhost"}}
+	db := &recordingDBConnector{}
+	r.DB = db
+	require.NoError(t, r.Run())
+	require.Zero(t, db.connections)
+}
+
+func TestSetupRPMExternalLocalhostTestsAndMigratesWithoutAdministeringServices(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	fs := r.FS.(*FakeFileSystem)
+	fs.Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+	fs.Files[r.Paths.RuntimePath("postgresql", "bin", "psql")] = nil
+	r.Env.(*FakeEnvManager).Env = map[string]string{"DATABASE_HOST": "localhost", "DATABASE_PORT": "5432", "DATABASE_USERNAME": "app", "DATABASE_NAME": "prod", "DATABASE_PASSWORD": "saved", "HEIMDALL_DATABASE_MODE": "external", "HEIMDALL_PROXY_MODE": "external", "PORT": "4000"}
+	db := &recordingDBConnector{}
+	r.DB = db
+	require.NoError(t, r.Run())
+	require.Equal(t, 1, db.connections)
+	require.Contains(t, out.String(), "Backend address: http://127.0.0.1:4000")
+	migrations := 0
+	for _, call := range r.Exec.(*FakeExecRunner).Calls {
+		if call.Name == "heimdall-server-db-setup" {
+			migrations++
+		}
+		require.NotEqual(t, "runuser", call.Name)
+		require.NotEqual(t, "caddy", call.Name)
+	}
+	require.Equal(t, 1, migrations)
+	out.Reset()
+	r.DryRun = true
+	require.NoError(t, r.Run())
+	require.Contains(t, out.String(), "Backend address: http://127.0.0.1:4000")
+	for _, action := range r.Systemd.(*FakeSystemdRunner).Actions {
+		require.NotContains(t, action, "postgres")
+		require.NotContains(t, action, "caddy")
+	}
+}
+
+func TestSetupRPMTLSSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		saved map[string]string
+		args  []string
+		want  string
+	}{
+		{"public", nil, []string{"--external-url=https://heimdall.example.com"}, "acme"},
+		{"offline", nil, nil, "internal"},
+		{"custom flag wins", map[string]string{"HEIMDALL_TLS_MODE": "internal"}, []string{"--tls-cert=/cert.pem", "--tls-key=/key.pem"}, "custom"},
+		{"saved cert", map[string]string{"HEIMDALL_TLS_MODE": "custom", "HEIMDALL_TLS_CERT": "/saved-cert.pem", "HEIMDALL_TLS_KEY": "/saved-key.pem"}, nil, "custom"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _, _ := newTestSetupRunner()
+			r.FS.(*FakeFileSystem).Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+			r.Env.(*FakeEnvManager).Env = tc.saved
+			cmd := NewSetupCmd(r)
+			cmd.SetArgs(append([]string{"--reconfigure"}, tc.args...))
+			require.NoError(t, cmd.Execute())
+			env := r.Env.(*FakeEnvManager).Env
+			require.Equal(t, tc.want, env["HEIMDALL_TLS_MODE"])
+			if tc.want == "custom" {
+				require.NotEmpty(t, env["HEIMDALL_TLS_CERT"])
+				require.NotEmpty(t, env["HEIMDALL_TLS_KEY"])
+			}
+		})
 	}
 }

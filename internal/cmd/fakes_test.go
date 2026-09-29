@@ -386,6 +386,11 @@ func (f *FakePrompter) Select(prompt string, defaultValue string, options []stri
 	if v, ok := f.Selects[prompt]; ok {
 		return v, nil
 	}
+	for i, option := range options {
+		if option == defaultValue {
+			return i, nil
+		}
+	}
 	return 0, nil
 }
 

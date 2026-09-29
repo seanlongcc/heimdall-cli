@@ -75,6 +75,12 @@ func schemaEntries() []ConfigEntry {
 		{Key: "NGINX_HOST", Category: "core", Type: "str", Default: "localhost", Description: "Hostname used by frontend defaults."},
 		{Key: "LOG_FILE", Category: "core", Type: "path", Default: "", Description: "Log file path. If unset, logs go to journald."},
 
+		// Deployment ownership is applied by setup, not a service restart.
+		{Key: "HEIMDALL_DATABASE_MODE", Category: "database", Type: "str", Choices: []string{"bundled", "external"}, Description: "Database ownership; change through setup."},
+		{Key: "HEIMDALL_PROXY_MODE", Category: "proxy", Type: "str", Choices: []string{"bundled", "external", "none"}, Description: "Proxy ownership; change through setup."},
+		{Key: "HEIMDALL_TLS_MODE", Category: "proxy", Type: "str", Choices: []string{"acme", "internal", "custom"}, Description: "Bundled proxy TLS mode; change through setup."},
+		{Key: "HEIMDALL_TLS_CERT", Category: "proxy", Type: "path", Description: "Custom TLS certificate path; change through setup."},
+		{Key: "HEIMDALL_TLS_KEY", Category: "proxy", Type: "path", Description: "Custom TLS private key path; change through setup."},
 		// Database
 		{Key: "DATABASE_HOST", Category: "database", Type: "str", Default: "localhost", Description: "PostgreSQL hostname."},
 		{Key: "DATABASE_PORT", Category: "database", Type: "int", Default: "5432", Validation: "1-65535", Description: "PostgreSQL port."},

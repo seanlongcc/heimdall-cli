@@ -23,6 +23,7 @@ type StatusRunner struct {
 
 // NewStatusCmd creates the status cobra command.
 func NewStatusCmd(runner *StatusRunner) *cobra.Command {
+	production := runner == nil
 	if runner == nil {
 		runner = &StatusRunner{
 			Exec:    &execRunner{},
@@ -59,6 +60,10 @@ the backend.env file to determine database credentials and configuration.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if production {
+				runner.Paths = commandPaths(cmd)
+				runner.Env = &FileEnvManager{Path: runner.Paths.EnvFile}
+			}
 			initIO(&runner.Out, nil, cmd)
 			runner.JSON = outputFormat == "json"
 			return runner.Run()
@@ -76,6 +81,22 @@ func (r *StatusRunner) Run() error {
 		return fmt.Errorf("reading env: %w", err)
 	}
 
+	dbCfg, err := resolveDBConfig(env)
+	if err != nil {
+		return err
+	}
+	if err := configureDBConnector(r.DB, r.Paths, r.FS, dbCfg); err != nil {
+		return err
+	}
+
+	deployment, err := resolveDeployment(env, Deployment{}, isConfigured(env))
+	if err != nil {
+		return err
+	}
+	bundledRuntime, err := r.Paths.hasRuntime(r.FS)
+	if err != nil {
+		return err
+	}
 	port := envDefault(env, "PORT", DefaultAppPort)
 
 	// Version
@@ -88,7 +109,7 @@ func (r *StatusRunner) Run() error {
 	}
 
 	if r.JSON {
-		return r.runJSON(env, version, port)
+		return r.runJSON(dbCfg, deployment, version, port)
 	}
 
 	fmt.Fprintf(r.Out, "Heimdall Server v%s\n", version)
@@ -116,11 +137,21 @@ func (r *StatusRunner) Run() error {
 	// Database
 	fmt.Fprintln(r.Out)
 	fmt.Fprintln(r.Out, "Database")
-	dbCfg := ExtractDBConfig(env)
 	fmt.Fprintf(r.Out, "  Target: %s@%s:%s/%s\n", dbCfg.User, dbCfg.Host, dbCfg.PortStr(), dbCfg.DBName)
 
-	// Local PG service check
-	if isLocalHost(dbCfg.Host) {
+	// An RPM's saved ownership, never a loopback hostname, identifies our service.
+	if bundledRuntime {
+		fmt.Fprintf(r.Out, "  Database mode: %s\n  Proxy mode: %s\n  TLS mode: %s\n", deployment.DatabaseMode, deployment.ProxyMode, deployment.TLSMode)
+		if deployment.DatabaseMode == "bundled" {
+			if active, _ := r.Systemd.IsActive("heimdall-postgresql"); active {
+				fmt.Fprintf(r.Out, "  %s\n", Ok("heimdall-postgresql running"))
+			} else {
+				fmt.Fprintf(r.Out, "  %s\n", Warn("heimdall-postgresql stopped"))
+			}
+		} else {
+			fmt.Fprintln(r.Out, "  External PostgreSQL (service managed by administrator)")
+		}
+	} else if isLocalHost(dbCfg.Host) {
 		pgFound := false
 		for ver := 18; ver >= 13; ver-- {
 			svc := fmt.Sprintf("postgresql-%d", ver)
@@ -274,13 +305,13 @@ func (r *StatusRunner) Run() error {
 }
 
 // runJSON outputs the status report as structured JSON.
-func (r *StatusRunner) runJSON(env map[string]string, version, port string) error {
-	dbCfg := ExtractDBConfig(env)
+func (r *StatusRunner) runJSON(dbCfg DBConfig, deployment Deployment, version, port string) error {
 	active, _ := r.Systemd.IsActive(ServiceName)
 
 	result := map[string]interface{}{
-		"version": version,
-		"port":    port,
+		"version":    version,
+		"port":       port,
+		"deployment": map[string]string{"database_mode": deployment.DatabaseMode, "proxy_mode": deployment.ProxyMode, "tls_mode": deployment.TLSMode},
 	}
 
 	// Service

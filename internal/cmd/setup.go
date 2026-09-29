@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -28,6 +29,12 @@ type SetupRunner struct {
 	ErrOut   io.Writer
 	Paths    Paths
 
+	DatabaseMode   string
+	ProxyMode      string
+	TLSMode        string
+	flagChanged    map[string]bool
+	bundledRuntime bool
+
 	// Flags
 	Interactive bool
 	NonInteract bool
@@ -48,6 +55,7 @@ type SetupRunner struct {
 // NewSetupCmd creates the setup cobra command. If runner is nil, a default
 // runner is used (for production); tests inject a pre-configured runner.
 func NewSetupCmd(runner *SetupRunner) *cobra.Command {
+	production := runner == nil
 	if runner == nil {
 		runner = &SetupRunner{
 			Exec:     &execRunner{},
@@ -83,6 +91,7 @@ Cloud environments (AWS, Azure, GCP) are auto-detected for security group hints.
 
   # Non-interactive setup with an external database
   sudo heimdall-cli setup --non-interactive \
+    --database-mode external --proxy-mode external \
     --db-host db.example.com --db-port 5432 \
     --db-user heimdall --db-password secret \
     --external-url https://heimdall.example.com
@@ -95,6 +104,10 @@ Cloud environments (AWS, Azure, GCP) are auto-detected for security group hints.
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
+			if production {
+				runner.Paths = commandPaths(cmd)
+				runner.Env = &FileEnvManager{Path: runner.Paths.EnvFile}
+			}
 			// Validate TLS flags
 			certSet := runner.TLSCert != ""
 			keySet := runner.TLSKey != ""
@@ -105,11 +118,18 @@ Cloud environments (AWS, Azure, GCP) are auto-detected for security group hints.
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			initIO(&runner.Out, &runner.ErrOut, cmd)
+			runner.flagChanged = map[string]bool{}
+			for _, name := range []string{"db-host", "db-port", "db-user", "db-password", "db-name", "external-url", "tls-cert", "tls-key", "tls-mode"} {
+				runner.flagChanged[name] = cmd.Flags().Changed(name)
+			}
 			return runner.Run()
 		},
 	}
 
 	flags := cmd.Flags()
+	flags.StringVar(&runner.DatabaseMode, "database-mode", "", "Database ownership: bundled or external")
+	flags.StringVar(&runner.ProxyMode, "proxy-mode", "", "Proxy ownership: bundled, external, or none")
+	flags.StringVar(&runner.TLSMode, "tls-mode", "", "Bundled proxy TLS: acme, internal, or custom")
 	flags.BoolVar(&runner.Interactive, "interactive", false, "Prompt for configuration values")
 	flags.BoolVar(&runner.NonInteract, "non-interactive", false, "Accept defaults and auto-generate secrets")
 	flags.StringVar(&runner.DBHost, "db-host", "localhost", "Database host")
@@ -130,8 +150,12 @@ Cloud environments (AWS, Azure, GCP) are auto-detected for security group hints.
 
 // Run executes the 7-step setup.
 func (r *SetupRunner) Run() error {
+	existing, err := r.readConfiguration()
+	if err != nil {
+		return err
+	}
 	if r.DryRun {
-		return r.printDryRun(isLocalHost(r.DBHost))
+		return r.printDryRun(r.DatabaseMode == "bundled")
 	}
 
 	if !r.Reconfigure {
@@ -143,18 +167,18 @@ func (r *SetupRunner) Run() error {
 
 	// Step 1: Configuration
 	fmt.Fprintln(r.Out, "=== Step 1/7: Configuration ===")
-	if err := r.stepConfigure(); err != nil {
+	if err := r.configure(existing); err != nil {
 		return WrapError(err, "configuration failed",
 			"Check file permissions: ls -la "+r.Env.GetEnvFilePath())
 	}
 
-	isLocalDB := isLocalHost(r.DBHost)
+	isLocalDB := r.DatabaseMode == "bundled"
 	r.printSummary(isLocalDB)
 
 	if r.Reconfigure {
 		fmt.Fprintln(r.Out)
-		fmt.Fprintln(r.Out, "Reconfiguration complete. Restart the service to apply changes:")
-		fmt.Fprintf(r.Out, "  sudo systemctl restart %s\n", ServiceName)
+		fmt.Fprintln(r.Out, "Reconfiguration complete. Run full setup to apply these settings:")
+		fmt.Fprintln(r.Out, "  sudo heimdall-cli setup --non-interactive")
 		return nil
 	}
 
@@ -168,7 +192,7 @@ func (r *SetupRunner) Run() error {
 		fmt.Fprintln(r.Out, "=== Step 2/7: PostgreSQL bootstrap ===")
 		if err := r.stepPostgresBootstrap(); err != nil {
 			return WrapError(err, "PostgreSQL bootstrap failed",
-				"Check PostgreSQL is installed: sudo dnf install postgresql-server")
+				"Check the selected PostgreSQL runtime and configuration")
 		}
 	}
 
@@ -200,6 +224,9 @@ func (r *SetupRunner) Run() error {
 	fmt.Fprintln(r.Out)
 	if r.SkipTLS {
 		fmt.Fprintln(r.Out, "=== Step 5/7: TLS reverse proxy (skipped -- --skip-tls) ===")
+	} else if r.ProxyMode != "bundled" {
+		fmt.Fprintf(r.Out, "=== Step 5/7: TLS reverse proxy (skipped -- %s proxy) ===\n", r.ProxyMode)
+		fmt.Fprintf(r.Out, "  Backend address: http://127.0.0.1:%s\n", envDefault(existing, "PORT", DefaultAppPort))
 	} else {
 		fmt.Fprintln(r.Out, "=== Step 5/7: TLS reverse proxy ===")
 		if err := r.stepTLS(); err != nil {
@@ -228,6 +255,7 @@ func (r *SetupRunner) Run() error {
 func (r *SetupRunner) printSummary(isLocalDB bool) {
 	fmt.Fprintln(r.Out, "Heimdall Server Setup")
 	fmt.Fprintln(r.Out, "---------------------")
+	fmt.Fprintf(r.Out, "  Database mode: %s\n  Proxy mode: %s\n  TLS mode: %s\n", r.DatabaseMode, r.ProxyMode, r.TLSMode)
 	fmt.Fprintf(r.Out, "  Database host: %s:%d\n", r.DBHost, r.DBPort)
 	fmt.Fprintf(r.Out, "  Database name: %s\n", r.DBName)
 	if r.SkipDB {
@@ -242,6 +270,8 @@ func (r *SetupRunner) printSummary(isLocalDB bool) {
 	}
 	if r.SkipTLS {
 		fmt.Fprintln(r.Out, "  TLS reverse proxy:    skip (--skip-tls)")
+	} else if r.ProxyMode != "bundled" {
+		fmt.Fprintf(r.Out, "  TLS reverse proxy:    skip (%s)\n", r.ProxyMode)
 	} else {
 		fmt.Fprintln(r.Out, "  TLS reverse proxy:    run")
 	}
@@ -250,7 +280,12 @@ func (r *SetupRunner) printSummary(isLocalDB bool) {
 
 // printDryRun shows what setup would do without making any changes.
 func (r *SetupRunner) printDryRun(isLocalDB bool) error {
+	existing, err := r.Env.ReadEnv()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	fmt.Fprintln(r.Out, "=== DRY RUN — no changes will be made ===")
+	fmt.Fprintf(r.Out, "  Database mode: %s\n  Proxy mode: %s\n  TLS mode: %s\n", r.DatabaseMode, r.ProxyMode, r.TLSMode)
 	fmt.Fprintln(r.Out)
 
 	fmt.Fprintln(r.Out, "=== Step 1/7: Configuration ===")
@@ -258,6 +293,10 @@ func (r *SetupRunner) printDryRun(isLocalDB bool) error {
 	fmt.Fprintf(r.Out, "  Database: %s@%s:%d/%s\n", r.DBUser, r.DBHost, r.DBPort, r.DBName)
 	if r.DBPassword == "" {
 		fmt.Fprintln(r.Out, "  DATABASE_PASSWORD: would auto-generate")
+	}
+
+	if r.Reconfigure {
+		return nil
 	}
 
 	fmt.Fprintln(r.Out)
@@ -289,6 +328,9 @@ func (r *SetupRunner) printDryRun(isLocalDB bool) error {
 	fmt.Fprintln(r.Out)
 	if r.SkipTLS {
 		fmt.Fprintln(r.Out, "=== Step 5/7: TLS reverse proxy (skipped -- --skip-tls) ===")
+	} else if r.ProxyMode != "bundled" {
+		fmt.Fprintf(r.Out, "=== Step 5/7: TLS reverse proxy (skipped -- %s proxy) ===\n", r.ProxyMode)
+		fmt.Fprintf(r.Out, "  Backend address: http://127.0.0.1:%s\n", envDefault(existing, "PORT", DefaultAppPort))
 	} else {
 		fmt.Fprintln(r.Out, "=== Step 5/7: TLS reverse proxy ===")
 		fmt.Fprintln(r.Out, "  Would configure Caddy TLS reverse proxy")
@@ -314,19 +356,132 @@ func (r *SetupRunner) printDryRun(isLocalDB bool) error {
 // In --interactive mode, prompts the user for each value.
 // Preserves existing values — only generates secrets if they don't already exist.
 func (r *SetupRunner) stepConfigure() error {
-	// Load existing values (safe if file doesn't exist yet)
-	existing, err := r.Env.ReadEnv()
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	existing, err := r.readConfiguration()
+	if err != nil {
 		return err
 	}
+	return r.configure(existing)
+}
 
-	// Interactive mode: prompt for each value
+func (r *SetupRunner) configure(existing map[string]string) error {
 	if r.Interactive {
 		return r.stepConfigureInteractive(existing)
 	}
-
-	// Non-interactive mode: use CLI flags, then existing, then defaults
 	return r.stepConfigureNonInteractive(existing)
+}
+
+// readConfiguration resolves the plan without generating secrets or executing
+// commands. Both dry-run and the actual setup therefore use the same settings.
+func (r *SetupRunner) readConfiguration() (map[string]string, error) {
+	existing, err := r.Env.ReadEnv()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if existing == nil {
+		existing = map[string]string{}
+	}
+	r.bundledRuntime, err = r.Paths.hasRuntime(r.FS)
+	if err != nil {
+		return nil, err
+	}
+	requested := Deployment{r.DatabaseMode, r.ProxyMode, r.TLSMode}
+	configured := isConfigured(existing)
+	if !r.bundledRuntime && requested.DatabaseMode == "" && existing["HEIMDALL_DATABASE_MODE"] == "" {
+		host := envDefault(existing, "DATABASE_HOST", "localhost")
+		if r.DBHost != "" && ((r.flagChanged == nil && r.DBHost != "localhost") || r.flagChanged["db-host"]) {
+			host = r.DBHost
+		}
+		requested.DatabaseMode = "external"
+		if isLocalHost(host) {
+			requested.DatabaseMode = "bundled"
+		}
+	}
+	if !r.bundledRuntime && requested.ProxyMode == "" && existing["HEIMDALL_PROXY_MODE"] == "" {
+		requested.ProxyMode = "bundled"
+	}
+	d, err := resolveDeployment(existing, requested, configured)
+	if err != nil {
+		return nil, err
+	}
+	host, port, user := "localhost", "5432", "postgres"
+	if r.bundledRuntime && d.DatabaseMode == "bundled" {
+		host, port, user = "127.0.0.1", "55432", "heimdall"
+	}
+	values := map[string]string{}
+	for k, v := range existing {
+		values[k] = v
+	}
+	// An RPM template's endpoints are placeholders, not an existing deployment.
+	if r.bundledRuntime && !configured && d.DatabaseMode == "bundled" {
+		for _, k := range []string{"DATABASE_HOST", "DATABASE_PORT", "DATABASE_USERNAME"} {
+			delete(values, k)
+		}
+	}
+	if values["DATABASE_URL"] != "" {
+		cfg, err := resolveDBConfig(values)
+		if err != nil {
+			return nil, err
+		}
+		values["DATABASE_HOST"], values["DATABASE_PORT"], values["DATABASE_USERNAME"], values["DATABASE_PASSWORD"], values["DATABASE_NAME"] = cfg.Host, cfg.PortStr(), cfg.User, cfg.Password, cfg.DBName
+	}
+	resolve := func(key, flag, value, fallback string) string {
+		changed := r.flagChanged[flag]
+		if r.flagChanged == nil {
+			changed = value != "" && value != "0" && value != fallback
+		}
+		if changed {
+			return value
+		}
+		return envDefault(values, key, fallback)
+	}
+	values["DATABASE_HOST"] = resolve("DATABASE_HOST", "db-host", r.DBHost, host)
+	values["DATABASE_PORT"] = resolve("DATABASE_PORT", "db-port", strconv.Itoa(r.DBPort), port)
+	values["DATABASE_USERNAME"] = resolve("DATABASE_USERNAME", "db-user", r.DBUser, user)
+	values["DATABASE_PASSWORD"] = resolve("DATABASE_PASSWORD", "db-password", r.DBPassword, "")
+	values["DATABASE_NAME"] = resolve("DATABASE_NAME", "db-name", r.DBName, "heimdall-server-production")
+	cfg, err := resolveDBConfig(values)
+	if err != nil {
+		return nil, err
+	}
+	r.DBHost, r.DBPort, r.DBUser, r.DBPassword, r.DBName = cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName
+	r.ExternalURL = resolve("EXTERNAL_URL", "external-url", r.ExternalURL, "")
+	r.TLSCert = resolve("HEIMDALL_TLS_CERT", "tls-cert", r.TLSCert, "")
+	r.TLSKey = resolve("HEIMDALL_TLS_KEY", "tls-key", r.TLSKey, "")
+	if requested.TLSMode == "" {
+		if (r.flagChanged["tls-cert"] || r.flagChanged["tls-key"]) && r.TLSCert != "" && r.TLSKey != "" {
+			d.TLSMode = "custom"
+		} else if existing["HEIMDALL_TLS_MODE"] == "" {
+			externalURL := r.ExternalURL
+			if externalURL == "" && existing["NGINX_HOST"] != "" {
+				externalURL = "https://" + existing["NGINX_HOST"]
+			}
+			d.TLSMode = defaultTLSMode(externalURL, r.TLSCert, r.TLSKey)
+		}
+	}
+	r.DatabaseMode, r.ProxyMode, r.TLSMode = d.DatabaseMode, d.ProxyMode, d.TLSMode
+	if r.ProxyMode == "bundled" && !r.SkipTLS {
+		if (r.TLSCert == "") != (r.TLSKey == "") {
+			return nil, fmt.Errorf("--tls-cert and --tls-key must be provided together")
+		}
+		if r.TLSMode == "custom" && (r.TLSCert == "" || r.TLSKey == "") {
+			return nil, fmt.Errorf("custom TLS requires --tls-cert and --tls-key")
+		}
+	}
+	if configured && r.bundledRuntime && existing["HEIMDALL_DATABASE_MODE"] == "" && requested.DatabaseMode == "" {
+		fmt.Fprintln(r.Out, "  Existing installation: defaulting database and proxy ownership to external; endpoints are preserved.")
+	}
+	return existing, nil
+}
+
+func defaultTLSMode(externalURL, cert, key string) string {
+	if cert != "" && key != "" {
+		return "custom"
+	}
+	u, err := url.Parse(externalURL)
+	if err == nil && u.Hostname() != "" && determineTLSStrategy(u.Hostname(), "", "") == tlsPublic {
+		return "acme"
+	}
+	return "internal"
 }
 
 // stepConfigureInteractive runs the topology-aware setup wizard.
@@ -349,8 +504,8 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 	}
 
 	// --- Re-run detection ---
-	hasExisting := existing["DATABASE_HOST"] != "" || existing["DATABASE_PASSWORD"] != ""
-	if hasExisting {
+	hasExisting := isConfigured(existing)
+	if hasExisting && !r.bundledRuntime {
 		fmt.Fprintln(r.Out, "  Existing Heimdall configuration detected.")
 		action, err := r.Prompter.Select("What would you like to do?", "",
 			[]string{
@@ -375,11 +530,15 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 
 	// --- Database topology ---
 	fmt.Fprintln(r.Out)
-	dbChoice, err := r.Prompter.Select("Database setup", "",
-		[]string{
-			"Local PostgreSQL (install on this machine)",
-			"External PostgreSQL (RDS, Azure, remote server)",
-		})
+	dbOptions := []string{"Local PostgreSQL (installed on this machine)", "External PostgreSQL (including an existing same-host instance)"}
+	if r.bundledRuntime {
+		dbOptions[0] = "Bundled PostgreSQL (Heimdall-owned instance)"
+	}
+	dbDefault := dbOptions[0]
+	if r.DatabaseMode == "external" {
+		dbDefault = dbOptions[1]
+	}
+	dbChoice, err := r.Prompter.Select("Database setup", dbDefault, dbOptions)
 	if err != nil {
 		return err
 	}
@@ -387,11 +546,18 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 	var dbHost, dbPort, dbUser, dbPassword, dbName string
 
 	switch dbChoice {
-	case 0: // Local PostgreSQL — use localhost defaults, only prompt for password
+	case 0: // Bundled/local PostgreSQL — only prompt for password
 		dbHost = "localhost"
 		dbPort = "5432"
 		dbUser = "postgres"
-		dbName = def("DATABASE_NAME", "heimdall-server-production")
+		dbName = r.DBName
+		if r.bundledRuntime {
+			dbHost, dbPort, dbUser = "127.0.0.1", "55432", "heimdall"
+			if r.DatabaseMode == "bundled" {
+				dbHost, dbPort, dbUser = r.DBHost, strconv.Itoa(r.DBPort), r.DBUser
+			}
+		}
+		r.DatabaseMode = "bundled"
 
 		dbPassword, err = r.interactivePassword(def("DATABASE_PASSWORD", ""))
 		if err != nil {
@@ -399,15 +565,16 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 		}
 
 	case 1: // External PostgreSQL — prompt for all DB fields
-		dbHost, err = r.Prompter.Input("Database host", def("DATABASE_HOST", ""))
+		r.DatabaseMode = "external"
+		dbHost, err = r.Prompter.Input("Database host", r.DBHost)
 		if err != nil {
 			return err
 		}
-		dbPort, err = r.Prompter.Input("Database port", def("DATABASE_PORT", "5432"))
+		dbPort, err = r.Prompter.Input("Database port", strconv.Itoa(r.DBPort))
 		if err != nil {
 			return err
 		}
-		dbUser, err = r.Prompter.Input("Database user", def("DATABASE_USERNAME", "postgres"))
+		dbUser, err = r.Prompter.Input("Database user", r.DBUser)
 		if err != nil {
 			return err
 		}
@@ -415,67 +582,47 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 		if err != nil {
 			return err
 		}
-		dbName, err = r.Prompter.Input("Database name", def("DATABASE_NAME", "heimdall-server-production"))
+		dbName, err = r.Prompter.Input("Database name", r.DBName)
 		if err != nil {
 			return err
 		}
 
-		// Validate connectivity to external DB before proceeding
-		fmt.Fprintln(r.Out)
-		fmt.Fprintf(r.Out, "  Testing connection to %s:%s/%s ... ", dbHost, dbPort, dbName)
-		port := DefaultDBPort
-		if p, parseErr := strconv.Atoi(dbPort); parseErr == nil {
-			port = p
-		}
-		if connErr := r.DB.TestConnection(dbHost, port, dbUser, dbPassword, dbName); connErr != nil {
-			fmt.Fprintln(r.Out)
-			fmt.Fprintf(r.Out, "  %s\n", Fail(fmt.Sprintf("connection failed: %v", connErr)))
-			action, selErr := r.Prompter.Select("Connection failed. What would you do?", "",
-				[]string{
-					"Abort setup (fix database connectivity first)",
-					"Continue anyway (I'll fix it later)",
-				})
-			if selErr != nil {
-				return selErr
-			}
-			if action == 0 {
-				return &CLIError{
-					Summary:    "database connection failed",
-					Suggestion: "Verify host/port/user/password, then re-run: sudo heimdall-cli setup --interactive",
-				}
-			}
-			fmt.Fprintf(r.Out, "  %s\n", Warn("continuing without verified connection"))
-		} else {
-			fmt.Fprintf(r.Out, "%s\n", Ok(fmt.Sprintf("connected as %s to %s:%s/%s", dbUser, dbHost, dbPort, dbName)))
-		}
 	}
 
 	// --- TLS topology ---
 	fmt.Fprintln(r.Out)
-	tlsChoice, err := r.Prompter.Select("TLS/SSL setup", "",
-		[]string{
-			"Caddy reverse proxy (automatic HTTPS)",
-			"External SSL termination (load balancer, nginx)",
-			"BYO certificate (provide cert and key paths)",
-			"No TLS (development/testing only)",
-		})
+	tlsOptions := []string{"Caddy reverse proxy (automatic HTTPS)", "External SSL termination (load balancer, nginx)", "BYO certificate (provide cert and key paths)", "No TLS (development/testing only)"}
+	tlsDefault := tlsOptions[0]
+	switch r.ProxyMode {
+	case "external":
+		tlsDefault = tlsOptions[1]
+	case "none":
+		tlsDefault = tlsOptions[3]
+	case "bundled":
+		if r.TLSMode == "custom" {
+			tlsDefault = tlsOptions[2]
+		}
+	}
+	tlsChoice, err := r.Prompter.Select("TLS/SSL setup", tlsDefault, tlsOptions)
 	if err != nil {
 		return err
 	}
 
 	switch tlsChoice {
-	case 0: // Caddy — stepTLS runs normally
-		// r.SkipTLS stays false
+	case 0: // Caddy
+		r.ProxyMode = "bundled"
 
 	case 1: // External SSL termination
-		r.SkipTLS = true
+		r.ProxyMode = "external"
 
 	case 2: // BYO certificate
-		certPath, certErr := r.Prompter.Input("TLS certificate path", def("TLS_CERT", ""))
+		r.ProxyMode = "bundled"
+		r.TLSMode = "custom"
+		certPath, certErr := r.Prompter.Input("TLS certificate path", r.TLSCert)
 		if certErr != nil {
 			return certErr
 		}
-		keyPath, keyErr := r.Prompter.Input("TLS private key path", def("TLS_KEY", ""))
+		keyPath, keyErr := r.Prompter.Input("TLS private key path", r.TLSKey)
 		if keyErr != nil {
 			return keyErr
 		}
@@ -483,18 +630,50 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 		r.TLSKey = keyPath
 
 	case 3: // No TLS
-		r.SkipTLS = true
+		r.ProxyMode = "none"
 	}
 
 	// --- Application config ---
 	fmt.Fprintln(r.Out)
-	externalURL, err := r.Prompter.Input("External URL", def("EXTERNAL_URL", ""))
+	externalURL, err := r.Prompter.Input("External URL", r.ExternalURL)
 	if err != nil {
 		return err
 	}
 	adminEmail, err := r.Prompter.Input("Admin email", def("ADMIN_EMAIL", "admin@heimdall.local"))
 	if err != nil {
 		return err
+	}
+
+	if r.ProxyMode == "bundled" && tlsChoice == 0 {
+		mode := r.TLSMode
+		if existing["HEIMDALL_TLS_MODE"] == "" && !r.flagChanged["tls-mode"] {
+			mode = defaultTLSMode(externalURL, "", "")
+		}
+		if r.bundledRuntime {
+			options := []string{"internal", "acme", "custom"}
+			choice, err := r.Prompter.Select("TLS mode", mode, options)
+			if err != nil {
+				return err
+			}
+			if choice < 0 || choice >= len(options) {
+				return fmt.Errorf("invalid TLS selection")
+			}
+			mode = options[choice]
+			if mode == "custom" {
+				r.TLSCert, err = r.Prompter.Input("TLS certificate path", r.TLSCert)
+				if err != nil {
+					return err
+				}
+				r.TLSKey, err = r.Prompter.Input("TLS private key path", r.TLSKey)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		r.TLSMode = mode
+	}
+	if r.ProxyMode == "bundled" && r.TLSMode == "custom" && (r.TLSCert == "" || r.TLSKey == "") {
+		return fmt.Errorf("custom TLS requires certificate and key paths")
 	}
 
 	// Build the prompted values map
@@ -636,26 +815,9 @@ func (r *SetupRunner) interactiveWriteConfig(existing, prompted map[string]strin
 
 // stepConfigureNonInteractive uses CLI flags, existing values, and defaults.
 func (r *SetupRunner) stepConfigureNonInteractive(existing map[string]string) error {
-	// Helper: use existing value, then CLI flag, then default
-	resolve := func(key, flagVal, fallback string) string {
-		if flagVal != "" && flagVal != fallback {
-			return flagVal
-		}
-		if v, ok := existing[key]; ok && v != "" {
-			return v
-		}
-		return fallback
-	}
-
-	dbHost := resolve("DATABASE_HOST", r.DBHost, "localhost")
-	dbPort := resolve("DATABASE_PORT", fmt.Sprintf("%d", r.DBPort), "5432")
-	dbUser := resolve("DATABASE_USERNAME", r.DBUser, "postgres")
-	dbName := resolve("DATABASE_NAME", r.DBName, "heimdall-server-production")
-
+	dbHost, dbPort, dbUser, dbName := r.DBHost, strconv.Itoa(r.DBPort), r.DBUser, r.DBName
 	dbPassword := r.DBPassword
-	if dbPassword == "" {
-		dbPassword = existing["DATABASE_PASSWORD"]
-	}
+
 	if dbPassword == "" {
 		b := make([]byte, 33)
 		if _, err := rand.Read(b); err != nil {
@@ -685,21 +847,12 @@ func (r *SetupRunner) stepConfigureNonInteractive(existing map[string]string) er
 		fmt.Fprintln(r.Out, "  API_KEY_SECRET auto-generated")
 	}
 
-	port := resolve("PORT", "", DefaultAppPort)
-	jwtExpire := resolve("JWT_EXPIRE_TIME", "", "1d")
-	nginxHost := resolve("NGINX_HOST", "", "localhost")
-	adminEmail := resolve("ADMIN_EMAIL", "", "admin@heimdall.local")
-
+	nginxHost := envDefault(existing, "NGINX_HOST", "localhost")
+	adminEmail := envDefault(existing, "ADMIN_EMAIL", "admin@heimdall.local")
 	externalURL := r.ExternalURL
 	if externalURL == "" {
-		externalURL = existing["EXTERNAL_URL"]
-	}
-	if externalURL == "" && nginxHost != "" {
 		externalURL = "https://" + nginxHost
 	}
-
-	_ = port      // used in entries below
-	_ = jwtExpire // used in entries below
 
 	return r.writeConfig(existing, dbHost, dbPort, dbUser, dbPassword, dbName,
 		jwtSecret, apiKeySecret, nginxHost, externalURL, adminEmail)
@@ -747,6 +900,15 @@ func (r *SetupRunner) writeConfig(existing map[string]string,
 		}
 	}
 
+	entries["HEIMDALL_DATABASE_MODE"] = r.DatabaseMode
+	entries["HEIMDALL_PROXY_MODE"] = r.ProxyMode
+	entries["HEIMDALL_TLS_MODE"] = r.TLSMode
+	entries["HEIMDALL_TLS_CERT"] = r.TLSCert
+	entries["HEIMDALL_TLS_KEY"] = r.TLSKey
+	if _, err := resolveDBConfig(entries); err != nil {
+		return err
+	}
+
 	if err := r.Env.WriteEnvFile(entries); err != nil {
 		return fmt.Errorf("writing env file: %w", err)
 	}
@@ -760,6 +922,7 @@ func (r *SetupRunner) writeConfig(existing map[string]string,
 	r.DBUser = dbUser
 	r.DBPassword = dbPassword
 	r.DBName = dbName
+	r.ExternalURL = externalURL
 
 	// Set file permissions (matches heimdall-configure.sh)
 	r.Exec.Run("chown", "root:heimdall", r.Env.GetEnvFilePath())
@@ -789,6 +952,17 @@ func (r *SetupRunner) stepPostgresBootstrap() error {
 
 // stepConnectionTest runs SELECT 1 against the database.
 func (r *SetupRunner) stepConnectionTest() error {
+	env, err := r.Env.ReadEnv()
+	if err != nil {
+		return err
+	}
+	cfg, err := resolveDBConfig(env)
+	if err != nil {
+		return err
+	}
+	if err := configureDBConnector(r.DB, r.Paths, r.FS, cfg); err != nil {
+		return err
+	}
 	if err := r.DB.TestConnection(r.DBHost, r.DBPort, r.DBUser, r.DBPassword, r.DBName); err != nil {
 		return fmt.Errorf("cannot connect to %s:%d/%s: %w", r.DBHost, r.DBPort, r.DBName, err)
 	}

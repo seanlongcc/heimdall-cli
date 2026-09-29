@@ -78,7 +78,7 @@ func newConfigGetCmd(runner *ConfigRunner) *cobra.Command {
 Secret values (passwords, JWT tokens, API keys) are automatically masked
 in the output. If the key is not set, its schema description and default
 value are shown as a hint.`,
-		Args:  cobra.ExactArgs(1),
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			initIO(&runner.Out, &runner.ErrOut, cmd)
 			return runner.Get(args[0])
@@ -94,7 +94,7 @@ func newConfigSetCmd(runner *ConfigRunner) *cobra.Command {
 the configuration schema before writing. This command requires root
 privileges because it modifies the service environment file. After
 setting a value, restart the service for the change to take effect.`,
-		Args:  cobra.ExactArgs(2),
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			initIO(&runner.Out, &runner.ErrOut, cmd)
 			return runner.Set(args[0], args[1])
@@ -165,6 +165,10 @@ func (r *ConfigRunner) Get(key string) error {
 
 // Set updates a config key after validation.
 func (r *ConfigRunner) Set(key, value string) error {
+	switch key {
+	case "HEIMDALL_DATABASE_MODE", "HEIMDALL_PROXY_MODE", "HEIMDALL_TLS_MODE", "HEIMDALL_TLS_CERT", "HEIMDALL_TLS_KEY":
+		return fmt.Errorf("change %s through heimdall-cli setup so ownership and configuration are applied together", key)
+	}
 	if r.CheckRoot != nil {
 		if err := r.CheckRoot(); err != nil {
 			return err
@@ -186,4 +190,3 @@ func (r *ConfigRunner) Set(key, value string) error {
 	fmt.Fprintf(r.Out, "Restart to apply: sudo systemctl restart %s\n", ServiceName)
 	return nil
 }
-

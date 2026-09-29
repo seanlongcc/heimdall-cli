@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-
 func newResetPasswordRunner(exec *FakeExecRunner, env *FakeEnvManager) (*ResetPasswordRunner, *bytes.Buffer, *bytes.Buffer) {
 	out := new(bytes.Buffer)
 	errOut := new(bytes.Buffer)
@@ -90,17 +89,14 @@ func TestResetPassword_UserNotFound(t *testing.T) {
 }
 
 func TestResetPassword_PsqlFailure(t *testing.T) {
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"psql -h": {Stdout: "", ExitCode: 1, Err: fmt.Errorf("connection refused")},
-	}}
-	env := &FakeEnvManager{Env: map[string]string{
-		"DATABASE_PASSWORD": "secret",
-	}}
-	runner, _, _ := newResetPasswordRunner(exec, env)
-
-	err := runner.Run("admin@heimdall.local", "aB1!cD2@eF3#gH4$")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "database update failed")
+	for _, failure := range []FakeExecResult{{ExitCode: 1, Err: fmt.Errorf("connection refused")}, {ExitCode: 1}} {
+		exec := &FakeExecRunner{Results: map[string]FakeExecResult{"psql -h": failure}}
+		env := &FakeEnvManager{Env: map[string]string{"DATABASE_PASSWORD": "secret"}}
+		runner, out, _ := newResetPasswordRunner(exec, env)
+		err := runner.Run("admin@heimdall.local", "aB1!cD2@eF3#gH4$")
+		require.ErrorContains(t, err, "database update failed")
+		require.NotContains(t, out.String(), "Password reset for")
+	}
 }
 
 func TestResetPassword_RejectsInvalidEmail(t *testing.T) {
@@ -155,7 +151,7 @@ func TestResetPassword_InteractiveDoubleEntry(t *testing.T) {
 		Prompter: &FakePrompter{
 			Inputs: map[string]string{
 				"New password (blank to auto-generate)": "aB1!cD2@eF3#gH4$",
-				"Confirm password":                     "aB1!cD2@eF3#gH4$",
+				"Confirm password":                      "aB1!cD2@eF3#gH4$",
 			},
 			IsTTY: true,
 		},
@@ -175,7 +171,7 @@ func TestResetPassword_InteractiveMismatch(t *testing.T) {
 		Prompter: &FakePrompter{
 			Inputs: map[string]string{
 				"New password (blank to auto-generate)": "aB1!cD2@eF3#gH4$",
-				"Confirm password":                     "different-password",
+				"Confirm password":                      "different-password",
 			},
 			IsTTY: true,
 		},

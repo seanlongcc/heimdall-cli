@@ -11,6 +11,7 @@ import (
 
 // RestoreRunner implements the restore command.
 type RestoreRunner struct {
+	Paths     Paths
 	Exec      ExecRunner
 	Env       EnvManager
 	FS        FileSystem
@@ -22,6 +23,7 @@ type RestoreRunner struct {
 
 // NewRestoreCmd creates the "restore" command.
 func NewRestoreCmd(runner *RestoreRunner) *cobra.Command {
+	production := runner == nil
 	if runner == nil {
 		runner = &RestoreRunner{
 			Exec:      &execRunner{},
@@ -50,6 +52,10 @@ service manually for changes to take effect. Requires root privileges.`,
     sudo systemctl restart heimdall-server`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if production {
+				runner.Paths = commandPaths(cmd)
+				runner.Env = &FileEnvManager{Path: runner.Paths.EnvFile}
+			}
 			initIO(&runner.Out, &runner.ErrOut, cmd)
 			return runner.Run(args[0])
 		},
@@ -125,11 +131,18 @@ func (r *RestoreRunner) Run(archive string) error {
 			fmt.Fprintf(r.ErrOut, "Database: could not read restored config: %v\n", err)
 			return fmt.Errorf("failed to read restored config: %w", err)
 		} else {
-			dbCfg := ExtractDBConfig(env)
+			dbCfg, err := resolveDBConfig(env)
+			if err != nil {
+				return err
+			}
+			binary, err := postgresClient(r.Paths, r.FS, "psql")
+			if err != nil {
+				return err
+			}
 
 			if dbCfg.Password != "" {
 				pgEnv := dbCfg.PgEnv()
-				_, exitCode, err := r.Exec.RunWithEnv(pgEnv, "psql",
+				_, exitCode, err := r.Exec.RunWithEnv(pgEnv, binary,
 					"-h", dbCfg.Host, "-p", dbCfg.PortStr(), "-U", dbCfg.User, "-d", dbCfg.DBName,
 					"-X", "-v", "ON_ERROR_STOP=1", "-f", sqlBackup)
 				if err != nil || exitCode != 0 {

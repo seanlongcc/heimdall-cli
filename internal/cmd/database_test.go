@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExtractDBConfig_AllDefaults(t *testing.T) {
@@ -89,4 +90,40 @@ func TestExtractDBConfig_NilMap(t *testing.T) {
 	cfg := ExtractDBConfig(nil)
 	assert.Equal(t, "localhost", cfg.Host)
 	assert.Equal(t, DefaultDBPort, cfg.Port)
+}
+
+func TestResolveDBConfigURLAndTLS(t *testing.T) {
+	cfg, err := resolveDBConfig(map[string]string{
+		"DATABASE_URL": "postgres://app:secret@db.example:6432/prod?sslmode=require",
+		"DATABASE_SSL": "true", "DATABASE_SSL_INSECURE": "false", "DATABASE_SSL_CA": "/certs/ca.pem", "DATABASE_SSL_CERT": "/certs/client.pem", "DATABASE_SSL_KEY": "/certs/key.pem",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "db.example", cfg.Host)
+	require.Equal(t, 6432, cfg.Port)
+	require.Equal(t, "app", cfg.User)
+	require.Equal(t, "secret", cfg.Password)
+	require.Equal(t, "prod", cfg.DBName)
+	require.Equal(t, map[string]string{"PGPASSWORD": "secret", "PGSSLMODE": "verify-full", "PGSSLROOTCERT": "/certs/ca.pem", "PGSSLCERT": "/certs/client.pem", "PGSSLKEY": "/certs/key.pem"}, cfg.PgEnv())
+	for _, env := range []map[string]string{
+		{"DATABASE_URL": "not a postgres URL"},
+		{"DATABASE_URL": "postgres://app:secret@db.example:6432/prod", "DATABASE_HOST": "other"},
+		{"DATABASE_URL": "postgres://app:secret@db.example:6432/prod", "DATABASE_PASSWORD": "different"},
+		{"DATABASE_PORT": "bad"},
+	} {
+		_, err := resolveDBConfig(env)
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), "secret")
+	}
+	for _, tc := range []struct{ ssl, insecure, want string }{{"true", "true", "require"}, {"true", "false", "verify-full"}, {"false", "", "disable"}, {"", "", "disable"}} {
+		cfg, err := resolveDBConfig(map[string]string{"DATABASE_SSL": tc.ssl, "DATABASE_SSL_INSECURE": tc.insecure})
+		require.NoError(t, err)
+		require.Equal(t, tc.want, cfg.PgEnv()["PGSSLMODE"])
+	}
+}
+
+func TestResolveDBConfigMatchesApplicationURLLiteralComponents(t *testing.T) {
+	cfg, err := resolveDBConfig(map[string]string{"DATABASE_URL": "postgres://app:p%40ss@db.example:6432/my%2Ddb"})
+	require.NoError(t, err)
+	require.Equal(t, "p%40ss", cfg.Password, "application URL parser retains percent escapes")
+	require.Equal(t, "my%2Ddb", cfg.DBName)
 }

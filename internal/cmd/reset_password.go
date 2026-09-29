@@ -16,6 +16,8 @@ var emailPattern = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-z
 
 // ResetPasswordRunner holds dependencies for the reset-password command.
 type ResetPasswordRunner struct {
+	Paths     Paths
+	FS        FileSystem
 	Exec      ExecRunner
 	Env       EnvManager
 	Hasher    PasswordHasher
@@ -42,7 +44,14 @@ func (r *ResetPasswordRunner) Run(email, password string) error {
 		return fmt.Errorf("failed to read env: %w", err)
 	}
 
-	dbCfg := ExtractDBConfig(env)
+	dbCfg, err := resolveDBConfig(env)
+	if err != nil {
+		return err
+	}
+	binary, err := postgresClient(r.Paths, r.FS, "psql")
+	if err != nil {
+		return err
+	}
 
 	if dbCfg.Password == "" {
 		return fmt.Errorf("DATABASE_PASSWORD not set in %s", r.Env.GetEnvFilePath())
@@ -92,7 +101,7 @@ func (r *ResetPasswordRunner) Run(email, password string) error {
 	sql := `UPDATE "Users" SET "encryptedPassword" = :'hash', "passwordChangedAt" = NOW(), "forcePasswordChange" = false, "updatedAt" = NOW() WHERE email = :'email';`
 
 	pgEnv := dbCfg.PgEnv()
-	stdout, _, err := r.Exec.RunWithEnv(pgEnv, "psql",
+	stdout, code, err := r.Exec.RunWithEnv(pgEnv, binary,
 		"-h", dbCfg.Host, "-p", dbCfg.PortStr(), "-U", dbCfg.User,
 		"-d", dbCfg.DBName,
 		"-v", "hash="+hashed, "-v", "email="+email,
@@ -100,6 +109,10 @@ func (r *ResetPasswordRunner) Run(email, password string) error {
 	)
 	if err != nil {
 		return fmt.Errorf("database update failed: %w", err)
+	}
+
+	if code != 0 {
+		return fmt.Errorf("database update failed: psql exited with status %d", code)
 	}
 
 	if strings.Contains(stdout, "UPDATE 0") {
@@ -123,6 +136,7 @@ func (r *ResetPasswordRunner) Run(email, password string) error {
 
 // NewResetPasswordCmd creates the reset-password cobra command.
 func NewResetPasswordCmd(runner *ResetPasswordRunner) *cobra.Command {
+	production := runner == nil
 	if runner == nil {
 		runner = &ResetPasswordRunner{
 			Exec:      &execRunner{},
@@ -159,6 +173,10 @@ DATABASE_PASSWORD in backend.env.`,
   sudo heimdall-cli reset-password user@example.com --password 'MyStr0ng!Pass#2026'`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if production {
+				runner.Paths = commandPaths(cmd)
+				runner.Env = &FileEnvManager{Path: runner.Paths.EnvFile}
+			}
 			initIO(&runner.Out, &runner.ErrOut, cmd)
 
 			email := "admin@heimdall.local"
@@ -173,4 +191,3 @@ DATABASE_PASSWORD in backend.env.`,
 	cmd.Flags().StringVarP(&password, "password", "p", "", "New password (generated if omitted)")
 	return cmd
 }
-

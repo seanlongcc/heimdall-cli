@@ -10,6 +10,7 @@ import (
 
 // ValidateRunner checks configuration before service start.
 type ValidateRunner struct {
+	Paths  Paths
 	Env    EnvManager
 	FS     FileSystem
 	DB     DBConnector
@@ -19,6 +20,7 @@ type ValidateRunner struct {
 
 // NewValidateCmd creates the validate command.
 func NewValidateCmd(runner *ValidateRunner) *cobra.Command {
+	production := runner == nil
 	if runner == nil {
 		runner = &ValidateRunner{
 			Env: NewFileEnvManager(),
@@ -54,6 +56,10 @@ an invalid configuration.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if production {
+				runner.Paths = commandPaths(cmd)
+				runner.Env = &FileEnvManager{Path: runner.Paths.EnvFile}
+			}
 			initIO(&runner.Out, nil, cmd)
 			return runner.Run()
 		},
@@ -95,9 +101,18 @@ func (r *ValidateRunner) Run() error {
 			"Run setup to generate missing values: sudo heimdall-cli setup")
 	}
 
+	dbCfg, err := resolveDBConfig(env)
+	if err != nil {
+		return err
+	}
+	if !r.SkipDB {
+		if err := configureDBConnector(r.DB, r.Paths, r.FS, dbCfg); err != nil {
+			return err
+		}
+	}
+
 	// Check database connectivity
 	if !r.SkipDB {
-		dbCfg := ExtractDBConfig(env)
 
 		if err := r.DB.TestConnection(dbCfg.Host, dbCfg.Port, dbCfg.User, dbCfg.Password, dbCfg.DBName); err != nil {
 			errors = append(errors, fmt.Sprintf("database unreachable at %s:%d/%s: %v", dbCfg.Host, dbCfg.Port, dbCfg.DBName, err))

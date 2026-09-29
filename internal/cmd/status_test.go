@@ -401,7 +401,7 @@ func TestStatusCmd_JSONOutput(t *testing.T) {
 		Systemd: &FakeSystemdRunner{
 			ActiveServices: map[string]bool{ServiceName: true},
 			Properties: map[string]string{
-				ServiceName + ":MainPID":             "5678",
+				ServiceName + ":MainPID":              "5678",
 				ServiceName + ":ActiveEnterTimestamp": "Mon 2026-01-01 00:00:00 UTC",
 			},
 		},
@@ -436,4 +436,23 @@ func TestStatusCmd_JSONOutput(t *testing.T) {
 	db, ok := result["database"].(map[string]interface{})
 	require.True(t, ok, "should have database key")
 	assert.Equal(t, float64(12), db["tables"])
+}
+
+func TestStatusRPMReportsOwnershipWithoutHostnameInference(t *testing.T) {
+	for _, mode := range []string{"bundled", "external"} {
+		r, out := newTestStatusRunner()
+		fs := r.FS.(*FakeFileSystem)
+		fs.Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+		fs.Files[r.Paths.RuntimePath("postgresql", "bin", "psql")] = nil
+		r.Env.(*FakeEnvManager).Env["HEIMDALL_DATABASE_MODE"] = mode
+		r.Env.(*FakeEnvManager).Env["HEIMDALL_PROXY_MODE"] = "external"
+		r.Systemd.(*FakeSystemdRunner).ActiveServices["heimdall-postgresql"] = true
+		require.NoError(t, r.Run())
+		require.Contains(t, out.String(), "Database mode: "+mode)
+		require.NotContains(t, out.String(), "no local PostgreSQL service running")
+		if mode == "bundled" {
+			require.Contains(t, out.String(), "heimdall-postgresql running")
+		}
+		require.Empty(t, r.Systemd.(*FakeSystemdRunner).Actions)
+	}
 }
