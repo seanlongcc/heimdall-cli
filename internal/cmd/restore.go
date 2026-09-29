@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -42,14 +45,16 @@ a temporary directory, backend.env is restored with proper ownership
 using psql.
 
 The database credentials are read from the restored backend.env, so
-the restore is self-contained. After restoring, you must restart the
-service manually for changes to take effect. Requires root privileges.`,
+the restore is self-contained. Private Caddy configuration and certificate/CA
+state are restored when present; older archives are accepted. RPM restores stop
+the app and selected private proxy, and block app startup until successful setup
+and migrations. PostgreSQL remains available for logical SQL restore. Requires root privileges.`,
 		Example: `  # Restore from a backup archive
   sudo heimdall-cli restore /var/backups/heimdall/heimdall-backup-20260401-120000.tar.gz
 
-  # Restore and immediately restart the service
+  # Restore, migrate, and start selected services
   sudo heimdall-cli restore /tmp/heimdall-backup-20260401-120000.tar.gz && \
-    sudo systemctl restart heimdall-server`,
+    sudo heimdall-cli setup --non-interactive`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if production {
@@ -85,83 +90,307 @@ func (r *RestoreRunner) Run(archive string) error {
 		}
 	}
 
-	tmpDir, err := r.FS.TempDir("heimdall-restore-")
+	// Archive parsing and destination validation happen before stopping services
+	// or changing any installed configuration/state.
+	info, err := r.FS.Lstat(archive)
 	if err != nil {
-		return fmt.Errorf("failed to create temp directory: %w", err)
+		return err
 	}
-	defer r.FS.RemoveAll(tmpDir)
-
-	// Extract archive with path traversal protection
-	_, exitCode, err := r.Exec.Run("tar", "xzf", archive, "-C", tmpDir,
-		"--no-same-owner", "--no-same-permissions")
-	if err != nil || exitCode != 0 {
-		return fmt.Errorf("failed to extract archive")
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("archive must be a regular file")
 	}
-
-	// Determine restore directory: check if backend.env is directly in tmpDir,
-	// otherwise look for a single subdirectory (standard tar extraction pattern).
-	restoreDir := tmpDir
-	envBackup := filepath.Join(tmpDir, "backend.env")
-	if !r.FS.Exists(envBackup) {
-		// Try to find a subdirectory created by tar extraction
-		entries, err := os.ReadDir(tmpDir)
-		if err == nil && len(entries) == 1 && entries[0].IsDir() {
-			restoreDir = filepath.Join(tmpDir, entries[0].Name())
+	tmpDir, err := os.MkdirTemp("", "heimdall-restore-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	tmpDir, err = filepath.EvalSymlinks(tmpDir)
+	if err != nil {
+		return err
+	}
+	restoreDir, err := extractRecoveryArchive(archive, tmpDir)
+	if err != nil {
+		return fmt.Errorf("failed to extract archive: %w", err)
+	}
+	envBackup := filepath.Join(restoreDir, "backend.env")
+	content, err := os.ReadFile(envBackup)
+	if err != nil {
+		return fmt.Errorf("failed to read restored config: %w", err)
+	}
+	env := ParseEnv(string(content))
+	dbCfg, err := resolveDBConfig(env)
+	if err != nil {
+		return err
+	}
+	sqlBackup := filepath.Join(restoreDir, "database.sql")
+	_, sqlErr := os.Stat(sqlBackup)
+	hasSQL := sqlErr == nil
+	rpm, err := r.Paths.hasRuntime(r.FS)
+	if err != nil {
+		return err
+	}
+	if hasSQL && dbCfg.Password == "" {
+		return fmt.Errorf("cannot restore database.sql without a password in restored config")
+	}
+	envDest := r.Env.GetEnvFilePath()
+	if err := safeManagedPath(r.FS, envDest); err != nil {
+		return err
+	}
+	config := r.Paths.ConfigDir
+	if config == "" {
+		config = ConfigDir
+	}
+	pending := filepath.Join(config, "upgrade-pending")
+	if rpm {
+		if err := safeManagedPath(r.FS, pending); err != nil {
+			return err
 		}
 	}
-
-	// Restore config
-	envBackup = filepath.Join(restoreDir, "backend.env")
-	envDest := r.Env.GetEnvFilePath()
+	trees := map[string]string{}
+	for name, dest := range recoveryTrees(r.Paths) {
+		source := filepath.Join(restoreDir, name)
+		if _, err := os.Stat(source); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		// Validate the existing tree too: recursive ownership must never follow a link.
+		if _, err := r.FS.Lstat(dest); err == nil {
+			if err := walkRecoveryTree(r.FS, dest, func(string, os.FileInfo) error { return nil }); err != nil {
+				return err
+			}
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := walkRecoveryTree(&osFileSystem{}, source, func(path string, info os.FileInfo) error {
+			rel, err := filepath.Rel(source, path)
+			if err != nil {
+				return err
+			}
+			target := filepath.Join(dest, rel)
+			if info.IsDir() {
+				target = filepath.Join(target, ".heimdall-recovery-check")
+			}
+			return safeManagedPath(r.FS, target)
+		}); err != nil {
+			return err
+		}
+		trees[name] = source
+	}
+	binary := ""
+	if hasSQL {
+		binary, err = postgresClient(r.Paths, r.FS, "psql")
+		if err != nil {
+			return err
+		}
+		if rpm {
+			if err := checkPostgresServer(r.Exec, r.Paths, r.FS, dbCfg); err != nil {
+				return fmt.Errorf("cannot restore database: %w; newer servers require a heimdall-server RPM with compatible PostgreSQL clients", err)
+			}
+		}
+	}
+	if rpm {
+		existing, err := r.Env.ReadEnv()
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("reading current selections: %w", err)
+		}
+		if err := r.FS.WriteFile(pending, []byte("Restore requires successful setup and migrations.\n"), 0600); err != nil {
+			return err
+		}
+		if err := recoveryPermissions(r.Exec, pending, "root:root", 0600); err != nil {
+			return err
+		}
+		if err := runChecked(r.Exec, "systemctl", "stop", ServiceName); err != nil {
+			return err
+		}
+		if existing["HEIMDALL_PROXY_MODE"] == "bundled" {
+			if err := runChecked(r.Exec, "systemctl", "stop", bundledCaddyService); err != nil {
+				return err
+			}
+		}
+	}
+	// Tighten an existing destination before it receives restored secrets.
+	if _, err := r.FS.Lstat(envDest); err == nil {
+		if err := recoveryPermissions(r.Exec, envDest, "root:heimdall", 0640); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if err := r.FS.CopyFile(envBackup, envDest); err != nil {
-		fmt.Fprintf(r.ErrOut, "Config:   restore failed: %v\n", err)
 		return fmt.Errorf("failed to restore config: %w", err)
 	}
-	// Set permissions and ownership
-	_ = os.Chmod(envDest, 0640)
-	r.Exec.Run("chown", "root:heimdall", envDest)
+	if err := recoveryPermissions(r.Exec, envDest, "root:heimdall", 0640); err != nil {
+		return err
+	}
 	fmt.Fprintln(r.Out, "Config:   restored")
-
-	// Restore database
-	sqlBackup := filepath.Join(restoreDir, "database.sql")
-	if r.FS.Exists(sqlBackup) {
-		// Re-read env from restored config
-		env, err := r.Env.ReadEnv()
-		if err != nil {
-			fmt.Fprintf(r.ErrOut, "Database: could not read restored config: %v\n", err)
-			return fmt.Errorf("failed to read restored config: %w", err)
-		} else {
-			dbCfg, err := resolveDBConfig(env)
+	for name, source := range trees {
+		dest := recoveryTrees(r.Paths)[name]
+		if err := walkRecoveryTree(&osFileSystem{}, source, func(path string, info os.FileInfo) error {
+			rel, err := filepath.Rel(source, path)
 			if err != nil {
 				return err
 			}
-			binary, err := postgresClient(r.Paths, r.FS, "psql")
-			if err != nil {
-				return err
+			target := filepath.Join(dest, rel)
+			owner, mode := "heimdall-caddy:heimdall-caddy", os.FileMode(0600)
+			if info.IsDir() {
+				mode = 0700
 			}
-
-			if dbCfg.Password != "" {
-				pgEnv := dbCfg.PgEnv()
-				_, exitCode, err := r.Exec.RunWithEnv(pgEnv, binary,
-					"-h", dbCfg.Host, "-p", dbCfg.PortStr(), "-U", dbCfg.User, "-d", dbCfg.DBName,
-					"-X", "-v", "ON_ERROR_STOP=1", "-f", sqlBackup)
-				if err != nil || exitCode != 0 {
-					fmt.Fprintln(r.ErrOut, "Database: restore FAILED")
-					if err != nil {
-						return fmt.Errorf("failed to restore database: %w", err)
-					}
-					return fmt.Errorf("failed to restore database: psql exited with status %d", exitCode)
-				} else {
-					fmt.Fprintln(r.Out, "Database: restored")
+			if name == "caddy-config" {
+				owner = "root:heimdall-caddy"
+				mode = info.Mode().Perm() & 0640
+				if info.IsDir() {
+					mode = 0750
 				}
-			} else {
-				fmt.Fprintln(r.Out, "Database: skipped (no password in restored config)")
-				return fmt.Errorf("cannot restore database.sql without a password in restored config")
 			}
+			if info.IsDir() {
+				err = r.FS.MkdirAll(target, mode)
+			} else {
+				err = r.FS.CopyFile(path, target)
+			}
+			if err != nil {
+				return err
+			}
+			return recoveryPermissions(r.Exec, target, owner, mode)
+		}); err != nil {
+			return fmt.Errorf("restoring %s: %w", name, err)
 		}
 	}
-
-	fmt.Fprintln(r.Out)
-	fmt.Fprintf(r.Out, "Restart the service: sudo systemctl restart %s\n", ServiceName)
+	if hasSQL {
+		_, code, err := r.Exec.RunWithEnv(dbCfg.PgEnv(), binary, "-h", dbCfg.Host, "-p", dbCfg.PortStr(), "-U", dbCfg.User, "-d", dbCfg.DBName, "-X", "-v", "ON_ERROR_STOP=1", "-f", sqlBackup)
+		if err != nil || code != 0 {
+			fmt.Fprintln(r.ErrOut, "Database: restore FAILED")
+			return fmt.Errorf("failed to restore database: psql exited with status %d: %v", code, err)
+		}
+		fmt.Fprintln(r.Out, "Database: restored")
+	} else {
+		fmt.Fprintln(r.Out, "Legacy archive restored configuration only; current database data was not changed.")
+	}
+	fmt.Fprintln(r.Out, "Run successful setup and migrations before starting the app: sudo heimdall-cli setup --non-interactive")
 	return nil
+}
+
+func recoveryPermissions(exec ExecRunner, path, owner string, mode os.FileMode) error {
+	if err := runChecked(exec, "chmod", fmt.Sprintf("%04o", mode), path); err != nil {
+		return err
+	}
+	return runChecked(exec, "chown", owner, path)
+}
+
+// Stream regular files into an empty private directory. Never ask tar to interpret
+// links, special files, duplicate entries or traversal paths as root.
+func extractRecoveryArchive(archive, dest string) (string, error) {
+	file, err := os.Open(archive)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	gz, err := gzip.NewReader(file)
+	if err != nil {
+		return "", err
+	}
+	defer gz.Close()
+	reader := tar.NewReader(gz)
+	seen := map[string]bool{}
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		name := strings.TrimPrefix(header.Name, "./")
+		name = strings.TrimSuffix(name, "/")
+		if name == "." || name == "" {
+			if header.Typeflag == tar.TypeDir {
+				continue
+			}
+			return "", fmt.Errorf("invalid empty archive path")
+		}
+		if filepath.IsAbs(name) || strings.Contains(name, "\\") || filepath.Clean(name) != name || name == ".." || strings.HasPrefix(name, "../") {
+			return "", fmt.Errorf("unsafe archive path: %s", header.Name)
+		}
+		if seen[name] {
+			return "", fmt.Errorf("duplicate archive path: %s", name)
+		}
+		seen[name] = true
+		target := filepath.Join(dest, name)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0700); err != nil {
+				return "", err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+				return "", err
+			}
+			out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, os.FileMode(header.Mode)&0640)
+			if err != nil {
+				return "", err
+			}
+			if err := out.Chmod(os.FileMode(header.Mode) & 0640); err != nil {
+				out.Close()
+				return "", err
+			}
+			_, copyErr := io.Copy(out, reader)
+			closeErr := out.Close()
+			if copyErr != nil {
+				return "", copyErr
+			}
+			if closeErr != nil {
+				return "", closeErr
+			}
+		default:
+			return "", fmt.Errorf("unsupported archive entry (links and special files are forbidden): %s", name)
+		}
+	}
+	// Consume the gzip trailer to detect truncated archives or checksum failures.
+	if _, err := io.Copy(io.Discard, gz); err != nil {
+		return "", err
+	}
+	root := dest
+	if _, err := os.Stat(filepath.Join(root, "backend.env")); os.IsNotExist(err) {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			return "", err
+		}
+		if len(entries) != 1 || !entries[0].IsDir() {
+			return "", fmt.Errorf("archive must contain backend.env in one backup directory")
+		}
+		root = filepath.Join(root, entries[0].Name())
+	}
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		top := strings.Split(rel, string(filepath.Separator))[0]
+		switch top {
+		case "backend.env", "database.sql":
+			if rel != top || !entry.Type().IsRegular() {
+				return fmt.Errorf("invalid archive file: %s", rel)
+			}
+		case "caddy-config", "caddy-state":
+			if rel == top && !entry.IsDir() {
+				return fmt.Errorf("invalid archive directory: %s", rel)
+			}
+		default:
+			return fmt.Errorf("unexpected archive path: %s", rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if info, err := os.Stat(filepath.Join(root, "backend.env")); err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("archive requires regular backend.env")
+	}
+	return root, nil
 }

@@ -52,6 +52,13 @@ func (r *SetPortRunner) Run(portStr string) (err error) {
 	if err != nil {
 		return err
 	}
+	ports := []selinuxPort{{"heimdall_server_port_t", portStr}}
+	if err := configureSELinuxPorts(r.Exec, r.FS, r.Paths.ConfigDir, ports, false); err != nil {
+		return err
+	}
+	if err := configureSELinuxPorts(r.Exec, r.FS, r.Paths.ConfigDir, ports, true); err != nil {
+		return err
+	}
 	var proxy *caddyUpdate
 	var before savedFile
 	if bundled {
@@ -101,16 +108,14 @@ func (r *SetPortRunner) Run(portStr string) (err error) {
 	}
 	fmt.Fprintf(r.Out, "Config:    PORT=%s (was %s)\n", portStr, oldPort)
 
-	// SELinux
-	r.Exec.Run("semanage", "port", "-a", "-t", "heimdall_server_port_t", "-p", "tcp", portStr)
-	r.Exec.Run("semanage", "port", "-m", "-t", "heimdall_server_port_t", "-p", "tcp", portStr)
-	fmt.Fprintf(r.Out, "SELinux:   port %s registered\n", portStr)
-
 	// firewalld
 	r.Exec.Run("firewall-cmd", "--permanent", "--add-port="+portStr+"/tcp")
 	r.Exec.Run("firewall-cmd", "--reload")
 	fmt.Fprintf(r.Out, "firewalld: port %s opened\n", portStr)
 
+	if err := restoreSELinuxPaths(r.Exec, r.FS, r.Paths.ConfigDir); err != nil {
+		return err
+	}
 	// Restart
 	fmt.Fprintln(r.Out)
 	fmt.Fprintln(r.Out, "Restarting service...")
@@ -154,7 +159,9 @@ three system layers in a single operation:
                service is allowed to bind under enforcing mode
   3. firewalld: Opens the new port in the permanent firewall rules
 
-After updating all layers, the service is automatically restarted.
+An existing incompatible SELinux port assignment is refused before changes.
+With bundled Caddy, its upstream is validated and updated with rollback on
+failure. After updating all layers, the application is restarted.
 The port must be between 1 and 65535. Requires root privileges.`,
 		Example: `  # Change the listen port to 8443
   sudo heimdall-cli set-port 8443

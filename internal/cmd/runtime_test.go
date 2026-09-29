@@ -149,8 +149,10 @@ esac
 
 func TestRealRPMClientRouting(t *testing.T) {
 	skipIfWindows(t)
-	dir := t.TempDir()
+	dir, pathErr := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, pathErr)
 	paths := DefaultPaths()
+	paths.ConfigDir = dir
 	paths.AppDir = filepath.Join(dir, "app")
 	paths.LibExecDir = filepath.Join(dir, "libexec")
 	paths.EnvFile = filepath.Join(dir, "backend.env")
@@ -164,6 +166,7 @@ func TestRealRPMClientRouting(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(ambient, name), []byte("#!/bin/sh\nexit 93\n"), 0755))
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(ambient, "chown"), []byte("#!/bin/sh\nexit 0\n"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(ambient, "systemctl"), []byte("#!/bin/sh\nexit 0\n"), 0755))
 	t.Setenv("PATH", ambient+":"+os.Getenv("PATH"))
 	log := filepath.Join(dir, "calls")
 	t.Setenv("HEIMDALL_TEST_CALLS", log)
@@ -183,6 +186,7 @@ case "$0" in
   exit 96 ;;
 esac
 case "$*" in
+ *server_version_num*) echo 180006 ;;
  *information_schema*) echo 7 ;;
  *UPDATE*) echo 'UPDATE 1' ;;
  *) echo 1 ;;
@@ -251,10 +255,16 @@ esac
 			data, err := os.ReadFile(log)
 			require.NoError(t, err)
 			lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-			require.Equal(t, filepath.Join(privateBin, command.client), lines[0])
-			require.Len(t, lines, 2)
-			_, err = os.Stat(lines[1])
-			require.True(t, os.IsNotExist(err), "inline TLS material must be removed")
+			clients := []string{command.client}
+			if command.name == "backup" || command.name == "restore" {
+				clients = append([]string{"psql"}, clients...)
+			}
+			require.Len(t, lines, 2*len(clients))
+			for i, client := range clients {
+				require.Equal(t, filepath.Join(privateBin, client), lines[2*i])
+				_, err = os.Stat(lines[2*i+1])
+				require.True(t, os.IsNotExist(err), "inline TLS material must be removed")
+			}
 		})
 	}
 	require.NoError(t, os.Remove(filepath.Join(privateBin, "psql")))

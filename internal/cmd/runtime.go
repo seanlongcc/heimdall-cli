@@ -139,8 +139,11 @@ func (r *osFileSystem) FindFiles(root, namePattern string) ([]string, error) {
 	var matches []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			// Tolerate per-entry errors (permissions, transient) — skip them.
-			return nil
+			if path == root && os.IsNotExist(err) {
+				return nil
+			}
+			// A partial inventory must not be reported as successful.
+			return err
 		}
 		if d.IsDir() {
 			return nil
@@ -155,10 +158,6 @@ func (r *osFileSystem) FindFiles(root, namePattern string) ([]string, error) {
 		return nil
 	})
 	if err != nil {
-		// Root missing is not an error for our use case — return empty.
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	return matches, nil

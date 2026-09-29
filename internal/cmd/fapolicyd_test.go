@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -12,7 +13,7 @@ import (
 // install layout. Each test mutates fields it cares about.
 func newFapolicydForTest() (*FapolicydRunner, *FakeExecRunner, *FakeFileSystem, *FakeSystemdRunner, *bytes.Buffer) {
 	exec := &FakeExecRunner{Results: map[string]FakeExecResult{}}
-	fs := &FakeFileSystem{Files: map[string][]byte{}}
+	fs := NewFakeFileSystem()
 	sysd := &FakeSystemdRunner{ActiveServices: map[string]bool{}}
 	out := &bytes.Buffer{}
 	r := &FapolicydRunner{
@@ -39,7 +40,7 @@ func TestFapolicyd_Add_TrustsNodeBinaryWhenPresent(t *testing.T) {
 			contains(c.Args, "add") &&
 			contains(c.Args, "/usr/share/heimdall-server/node") &&
 			contains(c.Args, "--trust-file") &&
-			contains(c.Args, "heimdall-server") {
+			contains(c.Args, "heimdall-server.pending") {
 			sawNodeAdd = true
 		}
 	}
@@ -221,3 +222,79 @@ func contains(haystack []string, needle string) bool {
 
 // avoid `fmt imported but not used` if helpers above stop using it.
 var _ = fmt.Sprintf
+
+func TestFapolicyd_PrivateRuntimeAndErrors(t *testing.T) {
+	r, exec, fs, _, _ := newFapolicydForTest()
+	paths := []string{"/usr/libexec/heimdall-server/runtime/node/bin/node", "/usr/libexec/heimdall-server/runtime/postgresql/bin/postgres", "/usr/libexec/heimdall-server/runtime/postgresql/lib/libpq.so.5", "/usr/libexec/heimdall-server/runtime/caddy/caddy", "/usr/share/heimdall-server/node_modules/argon2.node"}
+	for _, p := range paths {
+		fs.Files[p] = nil
+	}
+	fs.Files["/var/lib/heimdall-caddy/unsafe.node"] = nil
+	require.NoError(t, r.Add())
+	for _, p := range paths {
+		seen := false
+		for _, c := range exec.Calls {
+			if contains(c.Args, p) {
+				seen = true
+			}
+		}
+		require.True(t, seen, "missing trust: %s", p)
+	}
+	for _, c := range exec.Calls {
+		require.NotContains(t, c.Args, "/var/lib/heimdall-caddy/unsafe.node")
+	}
+	exec.Results["fapolicyd-cli --file add"] = FakeExecResult{ExitCode: 1, Stdout: "hash failed"}
+	require.Error(t, r.Add(), "real trust failures must not report success")
+}
+
+func TestFapolicydRefreshPreservesTrustOnFailureAndSkipsAliases(t *testing.T) {
+	r, exec, fs, sysd, out := newFapolicydForTest()
+	path := "/usr/libexec/heimdall-server/runtime/postgresql/lib/libpq.so.5.18"
+	fs.Files[path] = nil
+	trust := "/etc/fapolicyd/trust.d/heimdall-server"
+	fs.Files[trust] = []byte("old hash\n")
+	fs.Files["/etc/fapolicyd/trust.d/operator"] = []byte("untouched\n")
+	exec.Results["fapolicyd-cli --file add"] = FakeExecResult{ExitCode: 1}
+	require.Error(t, r.Add())
+	require.Equal(t, "old hash\n", string(fs.Files[trust]))
+	require.NotContains(t, out.String(), "trust entries added")
+	delete(exec.Results, "fapolicyd-cli --file add")
+	sysd.ActiveServices["fapolicyd"] = true
+	exec.Results["fapolicyd-cli --update"] = FakeExecResult{ExitCode: 1}
+	require.Error(t, r.Add())
+	require.NoError(t, fs.RemoveAll(path))
+	delete(exec.Results, "fapolicyd-cli --update")
+	require.NoError(t, r.Remove())
+	require.Equal(t, "untouched\n", string(fs.Files["/etc/fapolicyd/trust.d/operator"]))
+}
+func TestFapolicydMissingVersusBrokenTool(t *testing.T) {
+	for _, code := range []int{1, 127} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			r, exec, fs, _, out := newFapolicydForTest()
+			fs.Files["/usr/share/heimdall-server/argon.node"] = nil
+			exec.Results[`sh -c command -v "$1" sh fapolicyd-cli`] = FakeExecResult{ExitCode: code}
+			err := r.Add()
+			if code == 1 {
+				require.NoError(t, err)
+				require.Contains(t, out.String(), "not installed")
+			} else {
+				require.Error(t, err)
+			}
+			require.NotContains(t, out.String(), "trust entries added")
+			for _, c := range exec.Calls {
+				require.NotEqual(t, "fapolicyd-cli", c.Name)
+			}
+		})
+	}
+}
+
+func TestFapolicydRefusesLinkedAddonAndTrustRoot(t *testing.T) {
+	for _, path := range []string{"/usr/share/heimdall-server/native.node", "/usr/libexec/heimdall-server/runtime/postgresql/lib"} {
+		t.Run(path, func(t *testing.T) {
+			r, _, fs, _, _ := newFapolicydForTest()
+			fs.Files[path] = nil
+			r.FS = &securityFS{FakeFileSystem: fs, badPath: path, badMode: os.ModeSymlink | 0777}
+			require.Error(t, r.Add())
+		})
+	}
+}

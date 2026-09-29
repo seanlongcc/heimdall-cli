@@ -4,7 +4,7 @@ Admin CLI for Heimdall Server installations on Linux. Handles install-time setup
 
 ## Versioning
 
-heimdall-cli uses **independent semver**, decoupled from `heimdall-server`. The CLI and the server ship on their own cadence; compatibility is expressed via [`COMPAT.md`](./COMPAT.md) (cli → server version range) and via RPM `Requires:` ranges in `heimdall-server.spec`, not lockstep version pins.
+heimdall-cli uses **independent semver**, decoupled from `heimdall-server`. Standalone releases use [`COMPAT.md`](./COMPAT.md) for server compatibility. The bundled server RPM builds the CLI binary and man pages from one full immutable commit pin; runtime updates ship through a rebuilt server RPM.
 
 This follows the pattern of `kubectl`, `gh`, `stripe-cli`, `heroku-cli` — standalone CLIs that manage a service.
 
@@ -26,3 +26,94 @@ make snapshot        # full goreleaser snapshot under dist/
 ## Tests
 
 See [`docs/testing.md`](./docs/testing.md) for the unit / functional / integration / e2e pyramid.
+
+## Bundled RPM setup
+
+The architecture-specific `heimdall-server` RPM includes this CLI, Node.js 22.23.3,
+PostgreSQL 18.6 server/client tools, and Caddy 2.11.4. Setup does not install or
+download runtimes. Base OS libraries and systemd remain prerequisites.
+
+```sh
+sudo dnf install ./heimdall-server-*.rpm
+sudo heimdall-cli setup --interactive
+```
+
+Choose database and proxy ownership independently. Fresh installations default
+to `--database-mode bundled --proxy-mode bundled`. All four bundled/external
+combinations are supported; an existing database on localhost is still external
+when explicitly selected. `--proxy-mode none` supports HTTP-only development.
+Bundled Caddy supports `--tls-mode acme`, `internal`, or `custom`; custom mode
+uses `--tls-cert` and `--tls-key`. External PostgreSQL majors **13–18** are
+supported, using the private version-18 clients. Newer servers require a newer
+compatible RPM/client; setup and backup refuse them.
+
+```sh
+sudo heimdall-cli setup --non-interactive \
+  --database-mode external --proxy-mode bundled --tls-mode internal \
+  --db-host db.example.com --db-port 5432 --db-user heimdall \
+  --db-name heimdall --db-password 'replace-me' \
+  --external-url https://heimdall.example.test
+```
+
+Saved selections and secrets are reused. Explicit flags override saved settings;
+a configured installation without ownership keys defaults to external/external.
+`--skip-db` and `--skip-tls` skip work temporarily without changing ownership.
+`--dry-run` makes no changes; `--reconfigure` writes settings only. Apply topology
+changes with a subsequent full setup. Database ownership changes do not transfer
+data. A conflicting listener or SELinux service label requires another port or
+an administrator change; the CLI does not stop or relabel its owner.
+
+| Component | Private paths and identity |
+| --- | --- |
+| Runtime inventory | `/usr/share/heimdall-server/runtime-manifest.json` |
+| Node.js | `/usr/libexec/heimdall-server/runtime/node/bin/node` |
+| PostgreSQL | `/usr/libexec/heimdall-server/runtime/postgresql/{bin,lib,share}` |
+| PostgreSQL state/socket | `/var/lib/heimdall-postgresql/18/data`, `/run/heimdall-postgresql`; account `heimdall-postgres`, default `127.0.0.1:55432` |
+| Caddy | `/usr/libexec/heimdall-server/runtime/caddy/caddy`; account `heimdall-caddy` |
+| Caddy config/state/socket | `/etc/heimdall-server/caddy/Caddyfile`, `/var/lib/heimdall-caddy`, `/run/heimdall-caddy/admin.sock` |
+| Saved setup | `/etc/heimdall-server/backend.env` |
+
+Only `heimdall-server`, `heimdall-postgresql`, and `heimdall-caddy` are managed.
+`heimdall-cli stop` stops the application only, leaving selected private database
+and proxy services running. External services are never administered. Moving
+away from a bundled service disables its private unit and preserves its state.
+Without the runtime manifest, standalone CLI behavior remains available. An RPM
+installation never substitutes ambient clients for missing private executables.
+
+## Upgrade and recovery
+
+Before replacement, the RPM checks the PostgreSQL data major and requires a
+successful backup for an active configured installation. An operator who has
+made and verified a separate backup can explicitly set
+`SKIP_PREUPGRADE_BACKUP=true` in `/etc/sysconfig/heimdall-server`; the default is
+`false`. The RPM stops owned services and leaves an `upgrade-pending` marker.
+It does not migrate the database or restart the application automatically.
+
+```sh
+sudo dnf upgrade ./heimdall-server-*.rpm
+sudo heimdall-cli setup --non-interactive
+```
+
+Full setup uses saved selections, starts the selected database, applies
+migrations, clears `/etc/heimdall-server/upgrade-pending`, and starts the selected
+services. Failed migrations, `--skip-db`, and `--reconfigure` retain the marker
+and leave the application stopped. PostgreSQL major upgrades require a separate
+planned migration. RPM uninstall retains application/database state, CA keys,
+certificates, and service accounts; normal RPM `.rpmsave` rules apply to config.
+
+`heimdall-cli backup` creates a private mode-0600 archive containing a logical
+SQL dump and configuration, plus optional `caddy-config/` and `caddy-state/`
+entries for owned Caddy configuration and CA/certificate state. It never archives
+live PostgreSQL data files. Restore validates the archive before writes, accepts
+older archives without Caddy entries, preserves dedicated ownership, and requires
+successful setup/migrations before application startup. Restore overwrites the
+selected configuration/database; retain a verified backup before recovery.
+
+SELinux relabeling and fapolicyd trust refresh run before private service
+activation. Trust covers immutable private executables/libraries and application
+native addons, not mutable state. Only newly added TCP labels are recorded in
+root-owned mode-0600 `/etc/heimdall-server/selinux-ports`; compatible preexisting
+labels stay unowned. Removal affects only owned trust and port records. The
+policy uses the existing Heimdall domain and stock PostgreSQL/HTTP domains.
+Actual enforcing-host support must be validated on the deployment platform;
+stock bundled runtimes do not establish FIPS validation.

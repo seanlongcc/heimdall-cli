@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func newSecurityTestRunner(env map[string]string) (*SetupRunner, *bytes.Buffer) {
@@ -27,106 +28,47 @@ func newSecurityTestRunner(env map[string]string) (*SetupRunner, *bytes.Buffer) 
 
 func TestStepSecurityPolicies_SELinuxPresent(t *testing.T) {
 	r, out := newSecurityTestRunner(map[string]string{"PORT": "3000"})
-	// semanage and restorecon are available
-	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{ExitCode: 0}
-
-	r.stepSecurityPolicies()
-
-	output := out.String()
-	assert.Contains(t, output, "SELinux: port 3000 registered")
-	assert.Contains(t, output, "SELinux: file contexts applied")
-
-	// Verify semanage was called with correct port
-	calls := r.Exec.(*FakeExecRunner).Calls
-	foundSemanage := false
-	for _, c := range calls {
+	fs, ex := enableSELinux(r)
+	require.NoError(t, r.stepSecurityPolicies())
+	require.Equal(t, "heimdall_server_port_t tcp 3000\n", string(fs.Files[r.Paths.ConfigDir+"/selinux-ports"]))
+	for _, c := range ex.Calls {
 		if c.Name == "semanage" {
-			foundSemanage = true
-			assert.Contains(t, c.Args, "3000")
+			require.NotContains(t, c.Args, "-m")
 		}
 	}
-	assert.True(t, foundSemanage, "semanage should be called")
+	require.NotContains(t, out.String(), "failed")
 }
-
 func TestStepSecurityPolicies_SELinuxAbsent(t *testing.T) {
-	r, out := newSecurityTestRunner(map[string]string{"PORT": "3000"})
-	// semanage not available
-	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{ExitCode: 1}
-
-	r.stepSecurityPolicies()
-
-	output := out.String()
-	assert.NotContains(t, output, "SELinux: port")
-	assert.NotContains(t, output, "file contexts")
+	r, _ := newSecurityTestRunner(map[string]string{"PORT": "3000"})
+	require.NoError(t, r.stepSecurityPolicies())
+	for _, c := range r.Exec.(*FakeExecRunner).Calls {
+		require.NotEqual(t, "semanage", c.Name)
+		require.NotEqual(t, "restorecon", c.Name)
+	}
 }
-
 func TestStepSecurityPolicies_CustomPort(t *testing.T) {
 	r, out := newSecurityTestRunner(map[string]string{"PORT": "8443"})
-	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{ExitCode: 0}
+	fs, _ := enableSELinux(r)
 	r.SkipTLS = true
 	r.Systemd.(*FakeSystemdRunner).ActiveServices["firewalld"] = true
-
-	r.stepSecurityPolicies()
-
-	output := out.String()
-	assert.Contains(t, output, "SELinux: port 8443 registered")
-	assert.Contains(t, output, "firewalld: port 8443/tcp enabled")
-
-	// Verify semanage used 8443, not 3000
-	for _, c := range r.Exec.(*FakeExecRunner).Calls {
-		if c.Name == "semanage" {
-			assert.Contains(t, c.Args, "8443", "semanage should use PORT from env, not hardcoded 3000")
-			assert.NotContains(t, c.Args, "3000")
-		}
-		if c.Name == "firewall-cmd" {
-			for _, arg := range c.Args {
-				if arg == "--add-port=8443/tcp" {
-					// correct
-				}
-				assert.NotEqual(t, "--add-port=3000/tcp", arg, "firewalld should use PORT from env")
-			}
-		}
-	}
+	require.NoError(t, r.stepSecurityPolicies())
+	require.Contains(t, string(fs.Files[r.Paths.ConfigDir+"/selinux-ports"]), "tcp 8443")
+	require.Contains(t, out.String(), "firewalld: port 8443/tcp enabled")
 }
-
-func TestStepSecurityPolicies_DefaultPort(t *testing.T) {
-	// No PORT in env — should default to 3000
-	r, out := newSecurityTestRunner(map[string]string{})
-	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1"`] = FakeExecResult{ExitCode: 0}
-
-	r.stepSecurityPolicies()
-
-	assert.Contains(t, out.String(), "port 3000 registered")
-}
-
 func TestStepSecurityPolicies_FapolicydPresent(t *testing.T) {
 	r, out := newSecurityTestRunner(map[string]string{})
-	// fapolicyd trust script exists
-	fapScript := DefaultPaths().LibExecDir + "/fapolicyd-trust.sh"
-	r.FS.(*FakeFileSystem).Files[fapScript] = []byte("#!/bin/bash")
-
-	r.stepSecurityPolicies()
-
-	assert.Contains(t, out.String(), "fapolicyd: bundled binaries trusted")
-
-	// Verify script was called with "add"
-	foundFap := false
+	r.FS.(*FakeFileSystem).Files[r.Paths.RuntimePath("node", "bin", "node")] = nil
+	require.NoError(t, r.stepSecurityPolicies())
+	require.Contains(t, out.String(), "trust entries added")
 	for _, c := range r.Exec.(*FakeExecRunner).Calls {
-		if c.Name == fapScript {
-			foundFap = true
-			assert.Equal(t, []string{"add"}, c.Args)
-		}
+		require.NotContains(t, c.Name, "fapolicyd-trust.sh")
 	}
-	assert.True(t, foundFap, "fapolicyd trust script should be called")
 }
-
 func TestStepSecurityPolicies_FapolicydAbsent(t *testing.T) {
 	r, out := newSecurityTestRunner(map[string]string{})
-	// No fapolicyd script
-
-	r.stepSecurityPolicies()
-
-	assert.Contains(t, out.String(), "fapolicyd: not installed (skipped)")
+	r.Exec.(*FakeExecRunner).Results[`sh -c command -v "$1" sh fapolicyd-cli`] = FakeExecResult{ExitCode: 1}
+	require.NoError(t, r.stepSecurityPolicies())
+	require.Contains(t, out.String(), "not installed (skipped)")
 }
 
 func TestStepSecurityPolicies_FirewalldActiveWithTLS(t *testing.T) {

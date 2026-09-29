@@ -81,7 +81,7 @@ func NewSetupCmd(runner *SetupRunner) *cobra.Command {
 orchestrates seven steps in sequence:
 
   1. Configuration   Write backend.env with database credentials and secrets
-  2. PostgreSQL      Bootstrap local PostgreSQL (skipped for external databases)
+  2. PostgreSQL      Bootstrap selected bundled PostgreSQL (external servers unchanged)
   3. Connection test Verify database connectivity with SELECT 1
   4. Migrations      Run heimdall-server-db-setup to create/update schema
   5. TLS proxy       Configure Caddy as a reverse proxy with HTTPS
@@ -90,6 +90,16 @@ orchestrates seven steps in sequence:
 
 Steps can be selectively skipped with --skip-db and --skip-tls. Use
 --reconfigure to re-run only step 1 without restarting the full pipeline.
+The bundled RPM defaults to bundled database and proxy ownership on a fresh
+installation. Choose each independently with --database-mode and --proxy-mode;
+external PostgreSQL 13–18 is supported, including on localhost. --proxy-mode none
+is HTTP-only development. Bundled TLS supports acme, internal, and custom.
+Saved selections are reused; explicit flags override them. Temporary skips do
+not change ownership. Setup does not download or install bundled runtimes.
+
+After RPM upgrades, run setup --non-interactive to apply migrations and clear
+the upgrade-pending marker. Failed or skipped migrations and --reconfigure keep
+the application stopped. Database major migration is a separate operation.
 Cloud environments (AWS, Azure, GCP) are auto-detected for security group hints.`,
 		Example: `  # Full interactive setup with local PostgreSQL
   sudo heimdall-cli setup --interactive
@@ -101,8 +111,8 @@ Cloud environments (AWS, Azure, GCP) are auto-detected for security group hints.
     --db-user heimdall --db-password secret \
     --external-url https://heimdall.example.com
 
-  # Re-run setup skipping TLS (already handled by load balancer)
-  sudo heimdall-cli setup --non-interactive --skip-tls
+  # Use an existing HTTPS proxy
+  sudo heimdall-cli setup --non-interactive --proxy-mode external
 
   # Update only the configuration file without restarting services
   sudo heimdall-cli setup --reconfigure --db-host new-db.example.com`,
@@ -249,7 +259,9 @@ func (r *SetupRunner) Run() error {
 	// Step 6: Security policies
 	fmt.Fprintln(r.Out)
 	fmt.Fprintln(r.Out, "=== Step 6/7: Security policies ===")
-	r.stepSecurityPolicies()
+	if err := r.stepSecurityPolicies(); err != nil {
+		return err
+	}
 
 	// Step 7: Start service
 	fmt.Fprintln(r.Out)
@@ -1326,33 +1338,22 @@ func isPrivateHostname(host string) bool {
 
 // stepSecurityPolicies configures SELinux, fapolicyd, and firewalld.
 // Reads PORT from backend.env to register the correct port (not hardcoded 3000).
-func (r *SetupRunner) stepSecurityPolicies() {
-	// Read the actual port from config
-	env, _ := r.Env.ReadEnv()
+func (r *SetupRunner) stepSecurityPolicies() error {
+	env, err := r.Env.ReadEnv()
+	if err != nil {
+		return err
+	}
 	port := envDefault(env, "PORT", DefaultAppPort)
-
-	// SELinux: register port type (try -a first, fall back to -m)
-	_, exitCode, _ := r.Exec.Run("sh", "-c", `command -v "$1"`, "sh", "semanage")
-	if exitCode == 0 {
-		_, rc, _ := r.Exec.Run("semanage", "port", "-a", "-t", "heimdall_server_port_t", "-p", "tcp", port)
-		if rc != 0 {
-			r.Exec.Run("semanage", "port", "-m", "-t", "heimdall_server_port_t", "-p", "tcp", port)
+	if !r.bundledRuntime {
+		if err := configureSELinuxPorts(r.Exec, r.FS, r.Paths.ConfigDir, []selinuxPort{{"heimdall_server_port_t", port}}, true); err != nil {
+			return err
 		}
-		fmt.Fprintf(r.Out, "  SELinux: port %s registered\n", port)
+		if err := (&FapolicydRunner{Exec: r.Exec, FS: r.FS, Systemd: r.Systemd, Out: r.Out}).Add(); err != nil {
+			return err
+		}
 	}
-	_, exitCode, _ = r.Exec.Run("sh", "-c", `command -v "$1"`, "sh", "restorecon")
-	if exitCode == 0 {
-		r.Exec.Run("restorecon", "-R", r.Paths.AppDir, r.Paths.ConfigDir, r.Paths.DataDir)
-		fmt.Fprintln(r.Out, "  SELinux: file contexts applied")
-	}
-
-	// fapolicyd
-	fapScript := r.Paths.LibExecDir + "/fapolicyd-trust.sh"
-	if r.FS.Exists(fapScript) {
-		r.Exec.Run(fapScript, "add")
-		fmt.Fprintln(r.Out, "  fapolicyd: bundled binaries trusted")
-	} else {
-		fmt.Fprintln(r.Out, "  fapolicyd: not installed (skipped)")
+	if err := restoreSELinuxPaths(r.Exec, r.FS, r.Paths.AppDir, r.Paths.ConfigDir, r.Paths.DataDir, r.Paths.LogDir, "/run/heimdall-server"); err != nil {
+		return err
 	}
 
 	// firewalld
@@ -1383,6 +1384,7 @@ func (r *SetupRunner) stepSecurityPolicies() {
 	r.Exec.Run("chown", "-R", "heimdall:heimdall", r.Paths.LogDir)
 	r.Exec.Run("chmod", "0750", r.Paths.LogDir)
 	fmt.Fprintln(r.Out, "  File permissions hardened")
+	return nil
 }
 
 // stepStartService enables and starts the service.
@@ -1701,7 +1703,7 @@ func (r *SetupRunner) prepareBundledCaddy(env map[string]string) (*caddyUpdate, 
 		}
 		update.saved = append(update.saved, saved)
 	}
-	for _, path := range []string{update.pending, dir + "/certs/server.crt.pending", dir + "/certs/server.key.pending", "/var/lib/heimdall-caddy/data/.heimdall-check", "/var/lib/heimdall-caddy/config/.heimdall-check"} {
+	for _, path := range []string{update.pending, dir + "/certs/server.crt.pending", dir + "/certs/server.key.pending", "/var/lib/heimdall-caddy/data/.heimdall-check", "/var/lib/heimdall-caddy/config/.heimdall-check", "/run/heimdall-caddy/.heimdall-check"} {
 		if err := safeManagedPath(r.FS, path); err != nil {
 			return nil, err
 		}
@@ -1769,6 +1771,9 @@ func (r *SetupRunner) prepareBundledCaddy(env map[string]string) (*caddyUpdate, 
 	if err := runChecked(r.Exec, "chown", "root:heimdall-caddy", update.pending); err != nil {
 		return nil, err
 	}
+	if err := restoreSELinuxPaths(r.Exec, r.FS, r.Paths.LibExecDir+"/runtime/caddy", r.Paths.ConfigDir+"/caddy", "/var/lib/heimdall-caddy"); err != nil {
+		return nil, err
+	}
 	if err := runChecked(r.Exec, "runuser", "-u", "heimdall-caddy", "--", "env", "XDG_DATA_HOME=/var/lib/heimdall-caddy/data", "XDG_CONFIG_HOME=/var/lib/heimdall-caddy/config", binary, "validate", "--config", update.pending, "--adapter", "caddyfile"); err != nil {
 		return nil, fmt.Errorf("validating private Caddy configuration: %w", err)
 	}
@@ -1818,6 +1823,15 @@ func (u *caddyUpdate) apply() (err error) {
 	if err := r.FS.Rename(u.pending, u.saved[0].path); err != nil {
 		return err
 	}
+	if err := r.FS.MkdirAll("/run/heimdall-caddy", 0750); err != nil {
+		return err
+	}
+	if err := runChecked(r.Exec, "chown", "heimdall-caddy:heimdall-caddy", "/run/heimdall-caddy"); err != nil {
+		return err
+	}
+	if err := restoreSELinuxPaths(r.Exec, r.FS, r.Paths.ConfigDir+"/caddy", "/var/lib/heimdall-caddy", "/run/heimdall-caddy"); err != nil {
+		return err
+	}
 	if err := r.Systemd.Enable(bundledCaddyService); err != nil {
 		return err
 	}
@@ -1865,6 +1879,17 @@ const databaseDependencyContent = "[Unit]\nRequires=heimdall-postgresql.service\
 // activation restores configuration; a migration failure always leaves the app stopped.
 func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 	env := r.pendingConfig
+	marker := r.Paths.ConfigDir + "/upgrade-pending"
+	if err := rootManagedFile(r.FS, marker); err != nil {
+		return err
+	}
+	selectedPorts, err := r.selectedSELinuxPorts(env)
+	if err != nil {
+		return err
+	}
+	if err := configureSELinuxPorts(r.Exec, r.FS, r.Paths.ConfigDir, selectedPorts, false); err != nil {
+		return err
+	}
 	port, parseErr := strconv.Atoi(envDefault(env, "PORT", DefaultAppPort))
 	if parseErr != nil || port < 1 || port > 65535 {
 		return fmt.Errorf("PORT must be between 1 and 65535")
@@ -1913,6 +1938,12 @@ func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 			return err
 		}
 	}
+	if err := (&FapolicydRunner{Exec: r.Exec, FS: r.FS, Systemd: r.Systemd, Out: r.Out}).Add(); err != nil {
+		return err
+	}
+	if err := restoreSELinuxPaths(r.Exec, r.FS, r.Paths.LibExecDir+"/runtime", r.Paths.AppDir, r.Paths.ConfigDir); err != nil {
+		return err
+	}
 	if !r.SkipDB && r.DatabaseMode == "external" {
 		cfg, err := resolveDBConfig(env)
 		if err != nil {
@@ -1927,6 +1958,9 @@ func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 		if err := checkPostgresServer(r.Exec, r.Paths, r.FS, cfg); err != nil {
 			return err
 		}
+	}
+	if err := configureSELinuxPorts(r.Exec, r.FS, r.Paths.ConfigDir, selectedPorts, true); err != nil {
+		return err
 	}
 	var proxy *caddyUpdate
 	if !r.SkipTLS && r.ProxyMode == "bundled" {
@@ -2019,7 +2053,7 @@ func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 		err = errors.Join(append([]error{err}, rollback...)...)
 	}()
 	r.printSummary(r.DatabaseMode == "bundled")
-	if !r.SkipDB {
+	if !r.SkipDB || r.FS.Exists(marker) {
 		if err := r.Systemd.Stop(ServiceName); err != nil {
 			return err
 		}
@@ -2107,7 +2141,21 @@ func (r *SetupRunner) runBundledSetup(existing map[string]string) (err error) {
 	if r.ProxyMode != "bundled" {
 		fmt.Fprintf(r.Out, "  Backend address: http://127.0.0.1:%s\n", envDefault(env, "PORT", DefaultAppPort))
 	}
-	r.stepSecurityPolicies()
+	if err := r.stepSecurityPolicies(); err != nil {
+		return err
+	}
+	if r.FS.Exists(marker) {
+		if r.SkipDB {
+			fmt.Fprintln(r.Out, "Upgrade pending: migrations were skipped; application remains stopped. Run setup --non-interactive.")
+			return nil
+		}
+		if err := rootManagedFile(r.FS, marker); err != nil {
+			return err
+		}
+		if err := r.FS.RemoveAll(marker); err != nil {
+			return err
+		}
+	}
 	if err := r.stepStartService(); err != nil {
 		return err
 	}

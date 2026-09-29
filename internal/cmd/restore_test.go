@@ -1,493 +1,411 @@
 package cmd
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestRestore_RestoresConfigAndDB(t *testing.T) {
-	fs := NewFakeFileSystem()
-	// Simulate the archive file exists
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake-archive")
-	// After tar extraction, simulate the extracted files
-	// The restore reads env AFTER copying, so we set it in FakeEnvManager
-	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("PORT=3000\nDATABASE_PASSWORD=secret\n")
-	fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("-- SQL dump")
+// Recovery uses real files and archives; only database and host administration
+// are substituted. This catches extraction, path and permission mistakes.
+type recoveryFS struct {
+	osFileSystem
+	state string
+}
 
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":             {Stdout: "", ExitCode: 0},
-		"chown root:heimdall": {Stdout: "", ExitCode: 0},
-		"psql -h":             {Stdout: "", ExitCode: 0},
-	}}
+func (f *recoveryFS) path(p string) string {
+	if p == "/var/lib/heimdall-caddy" || strings.HasPrefix(p, "/var/lib/heimdall-caddy/") {
+		return f.state + strings.TrimPrefix(p, "/var/lib/heimdall-caddy")
+	}
+	return p
+}
+func (f *recoveryFS) ReadFile(p string) ([]byte, error) { return os.ReadFile(f.path(p)) }
+func (f *recoveryFS) WriteFile(p string, b []byte, m os.FileMode) error {
+	return os.WriteFile(f.path(p), b, m)
+}
+func (f *recoveryFS) Stat(p string) (os.FileInfo, error) { return os.Stat(f.path(p)) }
+func (f *recoveryFS) Lstat(p string) (os.FileInfo, error) {
+	if p == "/var" || p == "/var/lib" {
+		return os.Stat(filepath.Dir(f.state))
+	}
+	return os.Lstat(f.path(p))
+}
+func (f *recoveryFS) ReadDir(p string) ([]os.DirEntry, error) { return os.ReadDir(f.path(p)) }
+func (f *recoveryFS) MkdirAll(p string, m os.FileMode) error  { return os.MkdirAll(f.path(p), m) }
+func (f *recoveryFS) CopyFile(a, b string) error {
+	return f.osFileSystem.CopyFile(f.path(a), f.path(b))
+}
+func (f *recoveryFS) Exists(p string) bool { _, e := f.Stat(p); return e == nil }
 
+type recoveryExec struct {
+	fs      *recoveryFS
+	calls   []FakeExecCall
+	version string
+	fail    string
+	sql     string
+}
+
+func (e *recoveryExec) Run(name string, args ...string) (string, int, error) {
+	e.calls = append(e.calls, FakeExecCall{Name: name, Args: args})
+	key := strings.Join(append([]string{name}, args...), " ")
+	if e.fail != "" && strings.Contains(key, e.fail) {
+		return "fixture failure", 1, nil
+	}
+	switch name {
+	case "mkdir":
+		return "", 0, os.Mkdir(args[2], 0700)
+	case "tar":
+		return (&execRunner{}).Run(name, args...)
+	case "chmod":
+		var mode uint32
+		_, err := fmt.Sscanf(args[0], "%o", &mode)
+		if err != nil {
+			return "", 1, err
+		}
+		return "", 0, os.Chmod(e.fs.path(args[1]), os.FileMode(mode))
+	case "chown", "systemctl", "getent":
+		return "", 0, nil
+	default:
+		return "", 1, fmt.Errorf("unexpected command %s", key)
+	}
+}
+func (e *recoveryExec) RunWithEnv(env map[string]string, name string, args ...string) (string, int, error) {
+	if name == "tar" {
+		if e.fail != "" && strings.Contains(strings.Join(append([]string{name}, args...), " "), e.fail) {
+			return "fixture failure", 1, nil
+		}
+		return (&execRunner{}).RunWithEnv(env, name, args...)
+	}
+	e.calls = append(e.calls, FakeExecCall{Name: name, Args: args, Env: env})
+	key := strings.Join(append([]string{name}, args...), " ")
+	if e.fail != "" && strings.Contains(key, e.fail) {
+		return "fixture failure", 1, nil
+	}
+	if strings.Contains(key, "SHOW server_version_num") {
+		return e.version, 0, nil
+	}
+	for i, arg := range args {
+		if arg == "-f" {
+			if filepath.Base(name) == "pg_dump" {
+				return "", 0, os.WriteFile(args[i+1], []byte("-- sentinel SQL\n"), 0600)
+			}
+			data, err := os.ReadFile(args[i+1])
+			e.sql = string(data)
+			return "", 0, err
+		}
+	}
+	return "", 1, fmt.Errorf("unexpected database command %s", key)
+}
+func (e *recoveryExec) RunWithStdin(string, string, ...string) (string, int, error) {
+	return "", 1, fmt.Errorf("unexpected stdin command")
+}
+
+func recoveryFixture(t *testing.T, rpm bool) (Paths, *recoveryFS, *recoveryExec) {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	p := DefaultPaths()
+	p.ConfigDir = root + "/etc"
+	p.EnvFile = p.ConfigDir + "/backend.env"
+	p.AppDir = root + "/app"
+	p.LibExecDir = root + "/libexec"
+	p.DataDir = root + "/data"
+	fs := &recoveryFS{state: root + "/caddy-state"}
+	for _, dir := range []string{p.ConfigDir, p.AppDir, p.RuntimePath("postgresql", "bin")} {
+		require.NoError(t, os.MkdirAll(dir, 0700))
+	}
+	if rpm {
+		require.NoError(t, os.WriteFile(p.AppDir+"/runtime-manifest.json", []byte("{}"), 0600))
+	}
+	for _, name := range []string{"psql", "pg_dump"} {
+		require.NoError(t, os.WriteFile(p.RuntimePath("postgresql", "bin", name), nil, 0700))
+	}
+	require.NoError(t, os.WriteFile(p.EnvFile, []byte("DATABASE_PASSWORD='secret value'\nJWT_SECRET=original\nHEIMDALL_DATABASE_MODE=external\nHEIMDALL_PROXY_MODE=bundled\nHEIMDALL_TLS_MODE=internal\n"), 0640))
+	return p, fs, &recoveryExec{fs: fs, version: "180006"}
+}
+
+func recoveryArchive(t *testing.T, headers []*tar.Header, data []string) string {
+	t.Helper()
+	filename := filepath.Join(t.TempDir(), "archive.tar.gz")
+	f, err := os.Create(filename)
+	require.NoError(t, err)
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	for i, h := range headers {
+		if h.Typeflag == tar.TypeReg || h.Typeflag == 0 {
+			h.Size = int64(len(data[i]))
+		}
+		require.NoError(t, tw.WriteHeader(h))
+		if h.Size > 0 {
+			_, err = io.WriteString(tw, data[i])
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	require.NoError(t, f.Close())
+	return filename
+}
+func oldRecoveryArchive(t *testing.T, env string, sql bool) string {
+	h := []*tar.Header{{Name: "heimdall-backup-old/backend.env", Mode: 0644, Typeflag: tar.TypeReg}}
+	d := []string{env}
+	if sql {
+		h = append(h, &tar.Header{Name: "heimdall-backup-old/database.sql", Mode: 0644, Typeflag: tar.TypeReg})
+		d = append(d, "-- old SQL")
+	}
+	return recoveryArchive(t, h, d)
+}
+func recoveryRestore(p Paths, fs *recoveryFS, e *recoveryExec) *RestoreRunner {
+	return &RestoreRunner{Paths: p, FS: fs, Exec: e, Env: &FileEnvManager{Path: p.EnvFile}, Out: new(bytes.Buffer), ErrOut: new(bytes.Buffer)}
+}
+
+func TestRecoveryArchiveRoundTrip(t *testing.T) {
+	previousMask := syscall.Umask(0077)
+	defer syscall.Umask(previousMask)
+	p, fs, e := recoveryFixture(t, true)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	certificate := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	der, err := x509.CreateCertificate(rand.Reader, certificate, certificate, &key.PublicKey, key)
+	require.NoError(t, err)
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	require.NoError(t, err)
+	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	private := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	for path, content := range map[string][]byte{p.ConfigDir + "/caddy/Caddyfile": []byte("tls internal"), fs.state + "/data/caddy/pki/authorities/local/root.crt": ca, fs.state + "/data/caddy/pki/authorities/local/root.key": private} {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
+		mode := os.FileMode(0600)
+		if strings.HasSuffix(path, "Caddyfile") {
+			mode = 0640
+		}
+		require.NoError(t, os.WriteFile(path, content, mode))
+		require.NoError(t, os.Chmod(path, mode))
+	}
+	original, err := os.ReadFile(p.EnvFile)
+	require.NoError(t, err)
 	out := new(bytes.Buffer)
-	r := &RestoreRunner{
-		Exec: exec,
-		Env: &FakeEnvManager{
-			Env: map[string]string{
-				"DATABASE_PASSWORD": "secret",
-				"DATABASE_HOST":     "localhost",
-				"DATABASE_PORT":     "5432",
-				"DATABASE_USERNAME": "postgres",
-				"DATABASE_NAME":     "heimdall-server-production",
-			},
-			Path: "/etc/heimdall-server/backend.env",
-		},
-		FS:     fs,
-		Out:    out,
-		ErrOut: new(bytes.Buffer),
+	b := &BackupRunner{Paths: p, FS: fs, Exec: e, Env: &FileEnvManager{Path: p.EnvFile}, Out: out, ErrOut: out}
+	require.NoError(t, b.Run(filepath.Dir(p.ConfigDir)))
+	archives, err := filepath.Glob(filepath.Join(filepath.Dir(p.ConfigDir), "heimdall-backup-*.tar.gz"))
+	require.NoError(t, err)
+	require.Len(t, archives, 1)
+	info, err := os.Stat(archives[0])
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
+	require.NoError(t, os.WriteFile(p.EnvFile, []byte("JWT_SECRET=replaced\nHEIMDALL_PROXY_MODE=bundled\n"), 0640))
+	require.NoError(t, os.WriteFile(fs.state+"/data/caddy/pki/authorities/local/root.crt", []byte("different CA"), 0644))
+	require.NoError(t, os.WriteFile(fs.state+"/data/caddy/pki/authorities/local/root.key", []byte("different key"), 0600))
+	r := recoveryRestore(p, fs, e)
+	require.NoError(t, r.Run(archives[0]))
+	restored, err := os.ReadFile(p.EnvFile)
+	require.NoError(t, err)
+	require.Equal(t, original, restored)
+	restored, err = os.ReadFile(fs.state + "/data/caddy/pki/authorities/local/root.crt")
+	require.NoError(t, err)
+	block, _ := pem.Decode(restored)
+	require.NotNil(t, block)
+	parsed, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+	require.Equal(t, sha256.Sum256(der), sha256.Sum256(parsed.Raw))
+	restored, err = os.ReadFile(fs.state + "/data/caddy/pki/authorities/local/root.key")
+	require.NoError(t, err)
+	require.Equal(t, private, restored)
+	require.Equal(t, "-- sentinel SQL\n", e.sql)
+	for path, mode := range map[string]os.FileMode{p.EnvFile: 0640, p.ConfigDir + "/caddy/Caddyfile": 0640, p.ConfigDir + "/upgrade-pending": 0600, fs.state + "/data/caddy/pki/authorities/local/root.crt": 0600, fs.state + "/data/caddy/pki/authorities/local": 0700} {
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		require.Equal(t, mode, info.Mode().Perm(), path)
 	}
-
-	err := r.Run("/tmp/backup.tar.gz")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	output := out.String()
-	if !strings.Contains(output, "Config:   restored") {
-		t.Errorf("expected config restored message, got: %s", output)
-	}
-	if !strings.Contains(output, "Restart the service") {
-		t.Errorf("expected restart reminder, got: %s", output)
-	}
-
-	// Verify chown was called with correct ownership for the env file
-	foundChown := false
-	for _, call := range exec.Calls {
+	var stops, owners []string
+	for _, call := range e.calls {
+		if call.Name == "systemctl" {
+			require.Equal(t, "stop", call.Args[0])
+			stops = append(stops, call.Args[1])
+		}
 		if call.Name == "chown" {
-			foundChown = true
-			args := strings.Join(call.Args, " ")
-			if !strings.Contains(args, "root:heimdall") {
-				t.Errorf("expected chown root:heimdall, got args: %s", args)
-			}
-			if !strings.Contains(args, "/etc/heimdall-server/backend.env") {
-				t.Errorf("expected chown target to be env file, got args: %s", args)
-			}
+			owners = append(owners, call.Args[0])
 		}
+		require.NotContains(t, strings.Join(call.Args, " "), "/var/lib/heimdall-postgresql")
 	}
-	if !foundChown {
-		t.Error("chown should be called to set ownership on restored env file")
+	require.Equal(t, []string{"heimdall-server", "heimdall-caddy"}, stops)
+	require.Contains(t, owners, "root:heimdall")
+	require.Contains(t, owners, "root:heimdall-caddy")
+	require.Contains(t, owners, "heimdall-caddy:heimdall-caddy")
+	require.Contains(t, owners, "root:root")
+	require.Contains(t, r.Out.(*bytes.Buffer).String(), "setup --non-interactive")
+}
+
+func TestRestoreRejectsUnsafeArchivesBeforeMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		header tar.Header
+	}{
+		{"traversal", tar.Header{Name: "../escape", Typeflag: tar.TypeReg}},
+		{"absolute", tar.Header{Name: "/etc/escape", Typeflag: tar.TypeReg}},
+		{"nested traversal", tar.Header{Name: "backup/caddy-state/../../escape", Typeflag: tar.TypeReg}},
+		{"symlink", tar.Header{Name: "backup/caddy-state/link", Typeflag: tar.TypeSymlink, Linkname: "/etc"}},
+		{"hardlink", tar.Header{Name: "backup/caddy-state/key", Typeflag: tar.TypeLink, Linkname: "backend.env"}},
+		{"device", tar.Header{Name: "backup/caddy-state/device", Typeflag: tar.TypeChar}},
+		{"live cluster", tar.Header{Name: "backup/postgresql/data/PG_VERSION", Typeflag: tar.TypeReg}},
+		{"duplicate", tar.Header{Name: "backup/backend.env", Typeflag: tar.TypeReg}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, true)
+			original, err := os.ReadFile(p.EnvFile)
+			require.NoError(t, err)
+			archive := recoveryArchive(t, []*tar.Header{{Name: "backup/backend.env", Mode: 0600, Typeflag: tar.TypeReg}, &tc.header}, []string{"DATABASE_PASSWORD=secret\n", "evil"})
+			require.Error(t, recoveryRestore(p, fs, e).Run(archive))
+			got, err := os.ReadFile(p.EnvFile)
+			require.NoError(t, err)
+			require.Equal(t, original, got)
+			require.Empty(t, e.calls)
+			require.NoFileExists(t, p.ConfigDir+"/upgrade-pending")
+		})
 	}
 }
 
-func TestRestore_CallsPsqlWithCorrectArgs(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("x=y\n")
-	fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("SQL")
-
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":             {Stdout: "", ExitCode: 0},
-		"chown root:heimdall": {Stdout: "", ExitCode: 0},
-		"psql -h":             {Stdout: "", ExitCode: 0},
-	}}
-
-	r := &RestoreRunner{
-		Exec: exec,
-		Env: &FakeEnvManager{
-			Env: map[string]string{
-				"DATABASE_PASSWORD": "pass123",
-				"DATABASE_HOST":     "db.host",
-				"DATABASE_PORT":     "5433",
-				"DATABASE_USERNAME": "admin",
-				"DATABASE_NAME":     "testdb",
-			},
-			Path: "/etc/heimdall-server/backend.env",
-		},
-		FS:     fs,
-		Out:    new(bytes.Buffer),
-		ErrOut: new(bytes.Buffer),
-	}
-
-	require.NoError(t, r.Run("/tmp/backup.tar.gz"))
-
-	found := false
-	for _, call := range exec.Calls {
-		if call.Name == "psql" {
-			found = true
-			assert.Equal(t, []string{
-				"-h", "db.host", "-p", "5433", "-U", "admin", "-d", "testdb",
-				"-X", "-v", "ON_ERROR_STOP=1", "-f", "/tmp/heimdall-restore--fake/database.sql",
-			}, call.Args)
-			if call.Env["PGPASSWORD"] != "pass123" {
-				t.Errorf("expected PGPASSWORD=pass123, got: %s", call.Env["PGPASSWORD"])
+func TestRestoreOldArchiveAndStandaloneConfigOnly(t *testing.T) {
+	for _, rpm := range []bool{false, true} {
+		t.Run(fmt.Sprint(rpm), func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, rpm)
+			require.NoError(t, os.WriteFile(p.EnvFile, []byte("HEIMDALL_PROXY_MODE=external\n"), 0600))
+			archive := oldRecoveryArchive(t, "DATABASE_PASSWORD=old\nHEIMDALL_PROXY_MODE=external\n", true)
+			r := recoveryRestore(p, fs, e)
+			require.NoError(t, r.Run(archive))
+			require.Equal(t, "-- old SQL", e.sql)
+			for _, c := range e.calls {
+				if c.Name == "systemctl" {
+					require.Equal(t, []string{"stop", "heimdall-server"}, c.Args)
+				}
 			}
-			args := strings.Join(call.Args, " ")
-			if !strings.Contains(args, "-h db.host") {
-				t.Errorf("expected -h db.host: %s", args)
-			}
-			if !strings.Contains(args, "-d testdb") {
-				t.Errorf("expected -d testdb: %s", args)
-			}
-			break
-		}
+		})
 	}
-	if !found {
-		t.Error("psql was not called")
-	}
+	p, fs, e := recoveryFixture(t, false)
+	r := recoveryRestore(p, fs, e)
+	require.NoError(t, r.Run(oldRecoveryArchive(t, "PORT=3000\n", false)))
+	require.Empty(t, e.sql)
 }
 
-func TestRestore_MissingArchive(t *testing.T) {
-	fs := NewFakeFileSystem()
-	r := &RestoreRunner{
-		Exec:   &FakeExecRunner{},
-		Env:    &FakeEnvManager{},
-		FS:     fs,
-		Out:    new(bytes.Buffer),
-		ErrOut: new(bytes.Buffer),
-	}
-
-	err := r.Run("/nonexistent/backup.tar.gz")
-	if err == nil {
-		t.Fatal("expected error for missing archive")
-	}
-	if !strings.Contains(err.Error(), "file not found") {
-		t.Errorf("expected file not found error, got: %v", err)
-	}
-}
-
-func TestRestore_CorruptArchive(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/bad.tar.gz"] = []byte("corrupt")
-
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf": {Stdout: "", ExitCode: 1},
-	}}
-
-	r := &RestoreRunner{
-		Exec:   exec,
-		Env:    &FakeEnvManager{},
-		FS:     fs,
-		Out:    new(bytes.Buffer),
-		ErrOut: new(bytes.Buffer),
-	}
-
-	err := r.Run("/tmp/bad.tar.gz")
-	if err == nil {
-		t.Fatal("expected error for corrupt archive")
-	}
-	if !strings.Contains(err.Error(), "failed to extract") {
-		t.Errorf("expected extract error, got: %v", err)
-	}
-}
-
-func TestRestore_RejectsDBWithoutPassword(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("PORT=3000\n")
-	fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("SQL")
-
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":             {Stdout: "", ExitCode: 0},
-		"chown root:heimdall": {Stdout: "", ExitCode: 0},
-	}}
-
-	out := new(bytes.Buffer)
-	r := &RestoreRunner{
-		Exec: exec,
-		Env: &FakeEnvManager{
-			Env:  map[string]string{},
-			Path: "/etc/heimdall-server/backend.env",
-		},
-		FS:     fs,
-		Out:    out,
-		ErrOut: new(bytes.Buffer),
-	}
-
-	assert.Error(t, r.Run("/tmp/backup.tar.gz"))
-	assert.NotContains(t, out.String(), "Restart the service")
-	for _, call := range exec.Calls {
-		assert.NotEqual(t, "psql", call.Name)
-	}
-
-	if !strings.Contains(out.String(), "skipped (no password in restored config)") {
-		t.Errorf("expected skip message, got: %s", out.String())
-	}
-}
-
-func TestRestore_ConfirmationDeclined(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-
-	r := &RestoreRunner{
-		Exec:     &FakeExecRunner{Results: make(map[string]FakeExecResult)},
-		Env:      &FakeEnvManager{Env: map[string]string{}},
-		FS:       fs,
-		Out:      new(bytes.Buffer),
-		ErrOut:   new(bytes.Buffer),
-		Prompter: &FakePrompter{Confirms: map[string]bool{"Restore will overwrite current config and database. Continue?": false}, IsTTY: true},
-	}
-	err := r.Run("/tmp/backup.tar.gz")
-	assert.NoError(t, err)
-	assert.Contains(t, r.Out.(*bytes.Buffer).String(), "cancelled")
-}
-
-func TestRestore_SubdirectoryDetection(t *testing.T) {
-	// The subdirectory detection code uses os.ReadDir (not FS interface),
-	// so we need a real tmpDir. We use a RealSubdirFakeFileSystem that
-	// returns a real temp dir from TempDir() but still fakes other FS ops.
-	realTmpDir := t.TempDir()
-	subdir := filepath.Join(realTmpDir, "backup-20260401")
-	require.NoError(t, os.Mkdir(subdir, 0755))
-
-	fs := NewFakeFileSystem()
-	// Override TempDir to return the real directory
-	realFS := &realTempDirFakeFS{FakeFileSystem: fs, realDir: realTmpDir}
-
-	// Archive exists on the "fake" side
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	// backend.env is NOT in tmpDir root, but IS in the real subdir
-	// The code checks r.FS.Exists(envBackup) first — this must return false
-	// Then os.ReadDir finds the real subdir.
-	// After determining restoreDir, it checks r.FS.Exists on restoreDir paths.
-	fs.Files[filepath.Join(subdir, "backend.env")] = []byte("PORT=3000\n")
-	fs.Files[filepath.Join(subdir, "database.sql")] = []byte("-- SQL")
-
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":             {ExitCode: 0},
-		"chown root:heimdall": {ExitCode: 0},
-		"psql -h":             {ExitCode: 0},
-	}}
-
-	out := new(bytes.Buffer)
-	r := &RestoreRunner{
-		Exec: exec,
-		Env: &FakeEnvManager{
-			Env: map[string]string{
-				"DATABASE_PASSWORD": "secret",
-				"DATABASE_HOST":     "localhost",
-				"DATABASE_PORT":     "5432",
-				"DATABASE_USERNAME": "postgres",
-				"DATABASE_NAME":     "heimdall-server-production",
-			},
-			Path: "/etc/heimdall-server/backend.env",
-		},
-		FS:     realFS,
-		Out:    out,
-		ErrOut: new(bytes.Buffer),
-	}
-
-	err := r.Run("/tmp/backup.tar.gz")
-	assert.NoError(t, err)
-	assert.Contains(t, out.String(), "Config:   restored")
-}
-
-// realTempDirFakeFS wraps FakeFileSystem but returns a real temp directory.
-type realTempDirFakeFS struct {
-	*FakeFileSystem
-	realDir string
-}
-
-func (f *realTempDirFakeFS) TempDir(prefix string) (string, error) {
-	return f.realDir, nil
-}
-
-func (f *realTempDirFakeFS) RemoveAll(path string) error {
-	// Don't actually remove the real tmp dir — t.TempDir() handles cleanup
-	return nil
-}
-
-func TestRestore_DatabaseRestoreFailure(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("PORT=3000\n")
-	fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("-- bad SQL")
-
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":             {ExitCode: 0},
-		"chown root:heimdall": {ExitCode: 0},
-		"psql -h":             {Stdout: "", ExitCode: 3}, // ON_ERROR_STOP SQL error
-	}}
-
-	out := new(bytes.Buffer)
-	errOut := new(bytes.Buffer)
-	r := &RestoreRunner{
-		Exec: exec,
-		Env: &FakeEnvManager{
-			Env: map[string]string{
-				"DATABASE_PASSWORD": "secret",
-				"DATABASE_HOST":     "localhost",
-				"DATABASE_PORT":     "5432",
-				"DATABASE_USERNAME": "postgres",
-				"DATABASE_NAME":     "heimdall-server-production",
-			},
-			Path: "/etc/heimdall-server/backend.env",
-		},
-		FS:     fs,
-		Out:    out,
-		ErrOut: errOut,
-	}
-
-	err := r.Run("/tmp/backup.tar.gz")
-	assert.Error(t, err)
-	assert.Contains(t, errOut.String(), "restore FAILED")
-	assert.NotContains(t, out.String(), "Database: restored")
-	assert.NotContains(t, out.String(), "Restart the service")
-	exec.Verify(t)
-}
-
-func TestRestore_DatabaseRestoreExecError(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("PORT=3000\n")
-	fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("-- SQL")
-
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":             {ExitCode: 0},
-		"chown root:heimdall": {ExitCode: 0},
-		"psql -h":             {Err: fmt.Errorf("psql not found")},
-	}}
-
-	errOut := new(bytes.Buffer)
-	r := &RestoreRunner{
-		Exec: exec,
-		Env: &FakeEnvManager{
-			Env: map[string]string{
-				"DATABASE_PASSWORD": "secret",
-				"DATABASE_HOST":     "localhost",
-				"DATABASE_PORT":     "5432",
-				"DATABASE_USERNAME": "postgres",
-				"DATABASE_NAME":     "heimdall-server-production",
-			},
-			Path: "/etc/heimdall-server/backend.env",
-		},
-		FS:     fs,
-		Out:    new(bytes.Buffer),
-		ErrOut: errOut,
-	}
-
-	err := r.Run("/tmp/backup.tar.gz")
-	assert.Error(t, err)
-	assert.Contains(t, errOut.String(), "restore FAILED")
-	assert.NotContains(t, r.Out.(*bytes.Buffer).String(), "Restart the service")
-	exec.Verify(t)
-}
-
-func TestRestore_RootCheckFails(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	r := &RestoreRunner{
-		Exec:      &FakeExecRunner{Results: make(map[string]FakeExecResult)},
-		Env:       &FakeEnvManager{Env: map[string]string{}},
-		FS:        fs,
-		Out:       new(bytes.Buffer),
-		ErrOut:    new(bytes.Buffer),
-		CheckRoot: func() error { return fmt.Errorf("not root") },
-	}
-	err := r.Run("/tmp/backup.tar.gz")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "not root")
-}
-
-func TestRestore_ConfirmPromptError(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	r := &RestoreRunner{
-		Exec:   &FakeExecRunner{Results: make(map[string]FakeExecResult)},
-		Env:    &FakeEnvManager{Env: map[string]string{}},
-		FS:     fs,
-		Out:    new(bytes.Buffer),
-		ErrOut: new(bytes.Buffer),
-		Prompter: &FakePrompter{
-			IsTTY: true,
-			Err:   fmt.Errorf("input interrupted"),
-		},
-	}
-	err := r.Run("/tmp/backup.tar.gz")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "input interrupted")
-}
-
-func TestRestore_ConfigCopyFails(t *testing.T) {
-	for _, exists := range []bool{false, true} {
-		t.Run(fmt.Sprintf("exists=%t", exists), func(t *testing.T) {
-			fs := NewFakeFileSystem()
-			fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-			fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("SQL")
-			if exists {
-				// The path exists, but cannot be copied as a file.
-				fs.Dirs["/tmp/heimdall-restore--fake/backend.env"] = true
-			}
-
-			exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-				"tar xzf": {ExitCode: 0},
-			}}
-
-			out := new(bytes.Buffer)
-			r := &RestoreRunner{
-				Exec:   exec,
-				Env:    &FakeEnvManager{Env: map[string]string{"DATABASE_PASSWORD": "secret"}, Path: "/etc/heimdall-server/backend.env"},
-				FS:     fs,
-				Out:    out,
-				ErrOut: new(bytes.Buffer),
-			}
-
-			err := r.Run("/tmp/backup.tar.gz")
-			assert.ErrorIs(t, err, os.ErrNotExist)
-			assert.NotContains(t, out.String(), "Config:   restored")
-			assert.NotContains(t, out.String(), "Restart the service")
-			assert.Contains(t, r.ErrOut.(*bytes.Buffer).String(), "Config:   restore failed:")
-			for _, call := range exec.Calls {
-				assert.NotEqual(t, "psql", call.Name, "copy failure must stop database restore")
+func TestRestoreVersionAndCommandErrors(t *testing.T) {
+	for _, tc := range []struct{ name, version, fail string }{
+		{"old server", "120010", ""}, {"new server", "190000", ""}, {"malformed version", "broken", ""}, {"version query", "180006", "SHOW server_version_num"}, {"stop", "180006", "systemctl stop"}, {"owner", "180006", "chown root:heimdall"}, {"permissions", "180006", "chmod 0640"}, {"SQL", "180006", " -f "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, true)
+			e.version = tc.version
+			e.fail = tc.fail
+			r := recoveryRestore(p, fs, e)
+			require.Error(t, r.Run(oldRecoveryArchive(t, "DATABASE_PASSWORD=old\n", true)))
+			require.NotContains(t, r.Out.(*bytes.Buffer).String(), "Database: restored")
+			if strings.Contains(tc.name, "server") || strings.Contains(tc.name, "version") {
+				require.NoFileExists(t, p.ConfigDir+"/upgrade-pending")
 			}
 		})
 	}
 }
 
-func TestRestore_ReadEnvFailsAfterRestore(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("PORT=3000\n")
-	fs.Files["/tmp/heimdall-restore--fake/database.sql"] = []byte("-- SQL")
-
-	exec := &FakeExecRunner{Results: map[string]FakeExecResult{
-		"tar xzf":             {ExitCode: 0},
-		"chown root:heimdall": {ExitCode: 0},
-	}}
-
-	errOut := new(bytes.Buffer)
-	// CopyFile writes only to the fake filesystem; the real env read fails.
-	r := &RestoreRunner{
-		Exec:   exec,
-		Env:    &FileEnvManager{Path: filepath.Join(t.TempDir(), "backend.env")},
-		FS:     fs,
-		Out:    new(bytes.Buffer),
-		ErrOut: errOut,
-	}
-
-	err := r.Run("/tmp/backup.tar.gz")
-	assert.ErrorIs(t, err, os.ErrNotExist)
-	assert.Contains(t, errOut.String(), "Database: could not read restored config:")
-	assert.NotContains(t, r.Out.(*bytes.Buffer).String(), "Restart the service")
-	for _, call := range exec.Calls {
-		assert.NotEqual(t, "psql", call.Name)
+func TestRestoreLegacyConfigOnlyRPMRequiresSetup(t *testing.T) {
+	p, fs, e := recoveryFixture(t, true)
+	r := recoveryRestore(p, fs, e)
+	require.NoError(t, r.Run(oldRecoveryArchive(t, "PORT=3000\nJWT_SECRET=legacy\n", false)))
+	require.Empty(t, e.sql)
+	require.FileExists(t, p.ConfigDir+"/upgrade-pending")
+	require.Contains(t, r.Out.(*bytes.Buffer).String(), "configuration only")
+	for _, call := range e.calls {
+		require.NotEqual(t, "psql", filepath.Base(call.Name))
+		if call.Name == "systemctl" {
+			require.Equal(t, "stop", call.Args[0])
+		}
 	}
 }
 
-func TestRestore_NoPrompterSkipsConfirmation(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("PORT=3000\n")
-
-	r := &RestoreRunner{
-		Exec: &FakeExecRunner{Results: map[string]FakeExecResult{
-			"tar xzf":             {ExitCode: 0},
-			"chown root:heimdall": {ExitCode: 0},
-		}},
-		Env:    &FakeEnvManager{Env: map[string]string{}, Path: "/etc/heimdall-server/backend.env"},
-		FS:     fs,
-		Out:    new(bytes.Buffer),
-		ErrOut: new(bytes.Buffer),
-		// No Prompter — should skip confirmation and proceed
+func TestRestoreRejectsUnsafeDestinationsBeforeMutation(t *testing.T) {
+	for _, kind := range []string{"env symlink", "env hardlink", "Caddy ancestor symlink", "Caddy file hardlink", "marker symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, true)
+			outside := filepath.Join(filepath.Dir(p.ConfigDir), "outside")
+			require.NoError(t, os.WriteFile(outside, []byte("unchanged"), 0600))
+			switch kind {
+			case "env symlink":
+				require.NoError(t, os.Remove(p.EnvFile))
+				require.NoError(t, os.Symlink(outside, p.EnvFile))
+			case "env hardlink":
+				require.NoError(t, os.Remove(p.EnvFile))
+				require.NoError(t, os.Link(outside, p.EnvFile))
+			case "marker symlink":
+				require.NoError(t, os.Symlink(outside, p.ConfigDir+"/upgrade-pending"))
+			case "Caddy ancestor symlink":
+				require.NoError(t, os.Symlink(filepath.Dir(p.ConfigDir), p.ConfigDir+"/caddy"))
+			case "Caddy file hardlink":
+				require.NoError(t, os.Mkdir(p.ConfigDir+"/caddy", 0700))
+				require.NoError(t, os.Link(outside, p.ConfigDir+"/caddy/Caddyfile"))
+			}
+			archive := recoveryArchive(t, []*tar.Header{{Name: "backup/backend.env", Mode: 0640, Typeflag: tar.TypeReg}, {Name: "backup/caddy-config/Caddyfile", Mode: 0640, Typeflag: tar.TypeReg}}, []string{"PORT=3000\n", "tls internal"})
+			require.Error(t, recoveryRestore(p, fs, e).Run(archive))
+			require.Empty(t, e.calls)
+			data, err := os.ReadFile(outside)
+			require.NoError(t, err)
+			require.Equal(t, "unchanged", string(data))
+		})
 	}
-	err := r.Run("/tmp/backup.tar.gz")
-	assert.NoError(t, err)
-	assert.Contains(t, r.Out.(*bytes.Buffer).String(), "Config:   restored")
+}
+
+func TestRestoreMissingCorruptAndConfirmation(t *testing.T) {
+	p, fs, e := recoveryFixture(t, false)
+	r := recoveryRestore(p, fs, e)
+	require.ErrorContains(t, r.Run(p.ConfigDir+"/missing.tar.gz"), "file not found")
+	corrupt := p.ConfigDir + "/corrupt.tar.gz"
+	require.NoError(t, os.WriteFile(corrupt, []byte("broken"), 0600))
+	require.ErrorContains(t, r.Run(corrupt), "failed to extract")
+	archive := oldRecoveryArchive(t, "PORT=3000\n", false)
+	r.Prompter = &FakePrompter{IsTTY: true, Confirms: map[string]bool{"Restore will overwrite current config and database. Continue?": false}}
+	require.NoError(t, r.Run(archive))
+	require.Contains(t, r.Out.(*bytes.Buffer).String(), "cancelled")
+	r.Prompter = &FakePrompter{IsTTY: true, Err: fmt.Errorf("interrupted")}
+	require.ErrorContains(t, r.Run(archive), "interrupted")
+	r.CheckRoot = func() error { return fmt.Errorf("not root") }
+	require.ErrorContains(t, r.Run(archive), "not root")
+	require.Empty(t, e.calls)
+}
+
+type privateRecoveryCopyFS struct {
+	*recoveryFS
+	env string
+}
+
+func (f *privateRecoveryCopyFS) CopyFile(src, dest string) error {
+	if dest == f.env {
+		info, err := os.Stat(dest)
+		if err != nil {
+			return err
+		}
+		if info.Mode().Perm()&0007 != 0 {
+			return fmt.Errorf("refusing to expose restored secrets through existing public file")
+		}
+	}
+	return f.recoveryFS.CopyFile(src, dest)
+}
+func TestRestoreSecuresExistingEnvBeforeCopy(t *testing.T) {
+	p, fs, e := recoveryFixture(t, true)
+	require.NoError(t, os.Chmod(p.EnvFile, 0644))
+	r := recoveryRestore(p, fs, e)
+	r.FS = &privateRecoveryCopyFS{recoveryFS: fs, env: p.EnvFile}
+	require.NoError(t, r.Run(oldRecoveryArchive(t, "JWT_SECRET=restored\n", false)))
 }

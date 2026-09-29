@@ -521,6 +521,9 @@ func (r *PostgresBootstrapRunner) runBundled() error {
 		if err := runChecked(r.Exec, "chown", "heimdall-postgres:heimdall-postgres", filepath.Dir(install.DataDir), install.DataDir); err != nil {
 			return err
 		}
+		if err := restoreSELinuxPaths(r.Exec, r.FS, r.Paths.LibExecDir+"/runtime/postgresql", "/var/lib/heimdall-postgresql"); err != nil {
+			return err
+		}
 		if err := runChecked(r.Exec, "runuser", "-u", install.OSUser, "--", install.InitdbBin, "-D", install.DataDir, "--username="+install.OSUser, "--encoding=UTF8", "--locale=C.UTF-8", "--auth-local=peer", "--auth-host=scram-sha-256"); err != nil {
 			return err
 		}
@@ -571,6 +574,15 @@ func (r *PostgresBootstrapRunner) runBundled() error {
 		return err
 	}
 	if err := runChecked(r.Exec, "chown", "heimdall-postgres:heimdall-postgres", hbaPath); err != nil {
+		return err
+	}
+	if err := r.FS.MkdirAll(install.SocketDir, 0750); err != nil {
+		return err
+	}
+	if err := runChecked(r.Exec, "chown", "heimdall-postgres:heimdall-postgres", install.SocketDir); err != nil {
+		return err
+	}
+	if err := restoreSELinuxPaths(r.Exec, r.FS, r.Paths.LibExecDir+"/runtime/postgresql", "/var/lib/heimdall-postgresql", install.SocketDir); err != nil {
 		return err
 	}
 	if err := r.Systemd.Enable(install.Service); err != nil {

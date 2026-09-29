@@ -1211,22 +1211,10 @@ func TestSetupCmd_PrintSummary_RunTLS(t *testing.T) {
 }
 
 func TestRestore_ConfirmationAccepted(t *testing.T) {
-	fs := NewFakeFileSystem()
-	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
-	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("PORT=3000\n")
-
-	r := &RestoreRunner{
-		Exec: &FakeExecRunner{Results: map[string]FakeExecResult{
-			"tar xzf":             {ExitCode: 0},
-			"chown root:heimdall": {ExitCode: 0},
-		}},
-		Env:      &FakeEnvManager{Env: map[string]string{}, Path: "/etc/heimdall-server/backend.env"},
-		FS:       fs,
-		Out:      new(bytes.Buffer),
-		ErrOut:   new(bytes.Buffer),
-		Prompter: &FakePrompter{Confirms: map[string]bool{"Restore will overwrite current config and database. Continue?": true}, IsTTY: true},
-	}
-	err := r.Run("/tmp/backup.tar.gz")
+	p, fs, e := recoveryFixture(t, false)
+	r := recoveryRestore(p, fs, e)
+	r.Prompter = &FakePrompter{Confirms: map[string]bool{"Restore will overwrite current config and database. Continue?": true}, IsTTY: true}
+	err := r.Run(oldRecoveryArchive(t, "PORT=3000\n", false))
 	assert.NoError(t, err)
 	assert.Contains(t, r.Out.(*bytes.Buffer).String(), "Config:   restored")
 }

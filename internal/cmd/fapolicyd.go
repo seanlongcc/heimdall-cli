@@ -9,6 +9,10 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -17,8 +21,7 @@ import (
 // fapolicyd-cli writes to this file when called with --trust-file.
 const fapolicydTrustFile = "heimdall-server"
 
-// fapolicydAppDir is where the RPM lays down the bundled Node.js binary
-// and native .node addon files.
+// fapolicydAppDir contains application native .node addons.
 const fapolicydAppDir = "/usr/share/heimdall-server"
 
 // fapolicydService is the systemd unit name we check before reloading.
@@ -27,7 +30,7 @@ const fapolicydService = "fapolicyd"
 // FapolicydRunner replaces heimdall-fapolicyd-trust.sh. It registers the
 // bundled Node.js binary and native .node addon files with the fapolicyd
 // trust database (and removes them on uninstall). All operations are
-// tolerant — fapolicyd may not be installed at all on a given host.
+// skipped when the tool is absent; other failures are returned.
 type FapolicydRunner struct {
 	Exec    ExecRunner
 	FS      FileSystem
@@ -35,56 +38,143 @@ type FapolicydRunner struct {
 	Out     io.Writer
 }
 
-// Add registers the bundled binary and native addons with fapolicyd's
-// trust database, then reloads fapolicyd if it's running.
+// Add rebuilds only our dedicated trust file, atomically refreshing hashes and
+// dropping stale records. No mutable configuration or state tree is trusted.
 func (r *FapolicydRunner) Add() error {
-	nodeBin := fapolicydAppDir + "/node"
-	if r.FS.Exists(nodeBin) {
-		r.trust(nodeBin)
+	available, err := commandAvailable(r.Exec, "fapolicyd-cli")
+	if err != nil {
+		return err
 	}
-
+	if !available {
+		if r.Out != nil {
+			fmt.Fprintln(r.Out, "fapolicyd: not installed (skipped)")
+		}
+		return nil
+	}
+	var files []string
+	for _, root := range []string{
+		"/usr/libexec/heimdall-server/runtime/node/bin",
+		"/usr/libexec/heimdall-server/runtime/postgresql/bin",
+		"/usr/libexec/heimdall-server/runtime/postgresql/lib",
+		"/usr/libexec/heimdall-server/runtime/caddy",
+	} {
+		if err := safeManagedPath(r.FS, root+"/.heimdall-trust-check"); err != nil {
+			return err
+		}
+		found, err := r.FS.FindFiles(root, "*")
+		if err != nil {
+			return err
+		}
+		for _, path := range found {
+			info, err := r.FS.Lstat(path)
+			if err != nil {
+				return err
+			}
+			// libpq.so aliases resolve to the versioned regular file in this inventory.
+			if info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if strings.HasSuffix(root, "/lib") && !strings.Contains(filepath.Base(path), ".so") {
+				continue
+			}
+			files = append(files, path)
+		}
+	}
+	if err := safeManagedPath(r.FS, fapolicydAppDir+"/.heimdall-trust-check"); err != nil {
+		return err
+	}
 	addons, err := r.FS.FindFiles(fapolicydAppDir, "*.node")
 	if err != nil {
 		return err
 	}
-	for _, addon := range addons {
-		r.trust(addon)
+	files = append(files, addons...)
+	// Older standalone installations put Node here; RPM installs use private roots.
+	if !r.FS.Exists(fapolicydAppDir+"/runtime-manifest.json") && r.FS.Exists(fapolicydAppDir+"/node") {
+		files = append(files, fapolicydAppDir+"/node")
 	}
-
-	r.reloadIfActive()
+	sort.Strings(files)
+	trustPath := "/etc/fapolicyd/trust.d/" + fapolicydTrustFile
+	pending := trustPath + ".pending"
+	if len(files) == 0 && !r.FS.Exists(trustPath) {
+		return r.reloadIfActive()
+	}
+	for _, path := range []string{trustPath, pending} {
+		if err := safeManagedPath(r.FS, path); err != nil {
+			return err
+		}
+	}
+	for _, path := range files {
+		if err := requireRegular(r.FS, path); err != nil {
+			return err
+		}
+	}
+	if err := r.FS.MkdirAll("/etc/fapolicyd/trust.d", 0755); err != nil {
+		return err
+	}
+	if err := r.FS.RemoveAll(pending); err != nil {
+		return err
+	}
+	defer r.FS.RemoveAll(pending)
+	if err := r.FS.WriteFile(pending, nil, 0600); err != nil {
+		return err
+	}
+	if err := runChecked(r.Exec, "chown", "root:root", pending); err != nil {
+		return err
+	}
+	for _, path := range files {
+		if err := runChecked(r.Exec, "fapolicyd-cli", "--file", "add", path, "--trust-file", fapolicydTrustFile+".pending"); err != nil {
+			return err
+		}
+	}
+	if err := r.FS.Rename(pending, trustPath); err != nil {
+		return err
+	}
+	if err := r.reloadIfActive(); err != nil {
+		return err
+	}
+	if r.Out != nil {
+		fmt.Fprintln(r.Out, "fapolicyd: trust entries added (hashes refreshed)")
+	}
 	return nil
 }
 
-// Remove deletes the heimdall-server trust file and reloads fapolicyd
-// if it's running. Tolerant to a missing trust file (fapolicyd may
-// never have been configured with one).
+// Remove touches only the Heimdall trust file, preserving administrator lists.
 func (r *FapolicydRunner) Remove() error {
 	trustPath := "/etc/fapolicyd/trust.d/" + fapolicydTrustFile
-	// RemoveAll is no-op-on-missing — same as `rm -f`.
+	if err := safeManagedPath(r.FS, trustPath); err != nil {
+		return err
+	}
 	if err := r.FS.RemoveAll(trustPath); err != nil {
 		return err
 	}
-	r.reloadIfActive()
+	available, err := commandAvailable(r.Exec, "fapolicyd-cli")
+	if err != nil {
+		return err
+	}
+	if !available {
+		if r.Out != nil {
+			fmt.Fprintln(r.Out, "fapolicyd: not installed (skipped)")
+		}
+		return nil
+	}
+	if err := r.reloadIfActive(); err != nil {
+		return err
+	}
+	if r.Out != nil {
+		fmt.Fprintln(r.Out, "fapolicyd: trust entries removed")
+	}
 	return nil
 }
 
-// trust adds a single path to the heimdall-server trust list. Errors
-// are intentionally swallowed — fapolicyd-cli may be absent, the trust
-// file may already contain the entry, etc. Matches the bash `|| true`.
-func (r *FapolicydRunner) trust(path string) {
-	_, _, _ = r.Exec.Run("fapolicyd-cli",
-		"--file", "add", path,
-		"--trust-file", fapolicydTrustFile)
-}
-
-// reloadIfActive triggers fapolicyd-cli --update only when the service
-// is currently active. No-op (and silently swallows errors) otherwise.
-func (r *FapolicydRunner) reloadIfActive() {
+func (r *FapolicydRunner) reloadIfActive() error {
 	active, err := r.Systemd.IsActive(fapolicydService)
-	if err != nil || !active {
-		return
+	if err != nil {
+		return err
 	}
-	_, _, _ = r.Exec.Run("fapolicyd-cli", "--update")
+	if !active {
+		return nil
+	}
+	return runChecked(r.Exec, "fapolicyd-cli", "--update")
 }
 
 // NewFapolicydCmd builds the `fapolicyd` parent command with `add` and
@@ -101,8 +191,8 @@ func NewFapolicydCmd(runner *FapolicydRunner) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "fapolicyd",
-		Short: "Manage fapolicyd trust entries for the bundled Node.js binary",
-		Long: `Register the bundled Node.js binary and native .node addon files with
+		Short: "Manage fapolicyd trust for the private runtimes and native addons",
+		Long: `Register private Node.js, PostgreSQL, Caddy executables/libraries and .node addons with
 the fapolicyd trust database. Invoked from RPM %post / %postun
 scriptlets; usually you do not run this by hand.
 
@@ -122,7 +212,6 @@ This command is a safe no-op on systems without fapolicyd installed.`,
 			if err := runner.Add(); err != nil {
 				return err
 			}
-			fmt.Fprintln(runner.Out, "fapolicyd: trust entries added")
 			return nil
 		},
 	})
@@ -136,7 +225,6 @@ This command is a safe no-op on systems without fapolicyd installed.`,
 			if err := runner.Remove(); err != nil {
 				return err
 			}
-			fmt.Fprintln(runner.Out, "fapolicyd: trust entries removed")
 			return nil
 		},
 	})

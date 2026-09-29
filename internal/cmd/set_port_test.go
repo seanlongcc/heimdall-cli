@@ -53,7 +53,7 @@ func TestSetPort_UpdatesEnvFile(t *testing.T) {
 	assert.Contains(t, out.String(), "PORT=8080 (was 3000)")
 }
 
-func TestSetPort_CallsSemanageAndFirewall(t *testing.T) {
+func TestSetPort_SELinuxDisabledAndFirewall(t *testing.T) {
 	runner, exec, _, _, _ := newSetPortRunner()
 	err := runner.Run("8080")
 	require.NoError(t, err)
@@ -74,7 +74,7 @@ func TestSetPort_CallsSemanageAndFirewall(t *testing.T) {
 			}
 		}
 	}
-	assert.True(t, foundSemanage, "should call semanage")
+	assert.False(t, foundSemanage, "disabled SELinux requires no registration")
 	assert.True(t, foundFirewall, "should call firewall-cmd --add-port=8080/tcp")
 }
 

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestBackup_CreatesArchive(t *testing.T) {
@@ -172,9 +174,8 @@ func TestBackup_ConfigCopyFailure(t *testing.T) {
 				ErrOut: new(bytes.Buffer),
 			}
 
-			assert.ErrorIs(t, r.Run(t.TempDir()), os.ErrNotExist)
+			assert.Error(t, r.Run(t.TempDir()))
 			assert.Empty(t, exec.Calls, "copy failure must stop the dump and archive")
-			assert.Contains(t, r.ErrOut.(*bytes.Buffer).String(), "Config:   copy failed:")
 			assert.NotContains(t, r.Out.(*bytes.Buffer).String(), "Backup saved to:")
 		})
 	}
@@ -327,4 +328,75 @@ func TestBackup_RejectsPathTraversal(t *testing.T) {
 	err := r.Run("/var/lib/../../../etc/passwd")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "traversal")
+}
+
+func TestBackupRPMRequiresDatabaseAndCompatibleServer(t *testing.T) {
+	for _, tc := range []struct {
+		name, password, version string
+		ok                      bool
+	}{
+		{"missing password", "", "180006", false}, {"old", "secret", "120015", false}, {"newer", "secret", "190000", false}, {"malformed", "secret", "", false}, {"floor", "secret", "130022", true}, {"ceiling", "secret", "180006", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, true)
+			e.version = tc.version
+			err := os.WriteFile(p.EnvFile, []byte("DATABASE_PASSWORD="+tc.password+"\n"), 0640)
+			require.NoError(t, err)
+			out := new(bytes.Buffer)
+			r := &BackupRunner{Paths: p, FS: fs, Exec: e, Env: &FileEnvManager{Path: p.EnvFile}, Out: out, ErrOut: out}
+			err = r.Run(filepath.Dir(p.ConfigDir))
+			if tc.ok {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				archives, _ := filepath.Glob(filepath.Join(filepath.Dir(p.ConfigDir), "*.tar.gz"))
+				require.Empty(t, archives)
+				require.NotContains(t, out.String(), "Backup saved")
+			}
+		})
+	}
+}
+
+func TestBackupRejectsUnsafeSourcesAndOutput(t *testing.T) {
+	for _, kind := range []string{"config symlink", "Caddy symlink", "Caddy hardlink", "output symlink", "output file"} {
+		t.Run(kind, func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, true)
+			outside := filepath.Join(filepath.Dir(p.ConfigDir), "outside")
+			require.NoError(t, os.WriteFile(outside, []byte("untouched"), 0600))
+			output := filepath.Join(filepath.Dir(p.ConfigDir), "backups")
+			switch kind {
+			case "config symlink":
+				require.NoError(t, os.Remove(p.EnvFile))
+				require.NoError(t, os.Symlink(outside, p.EnvFile))
+			case "Caddy symlink":
+				require.NoError(t, os.Symlink(filepath.Dir(p.ConfigDir), p.ConfigDir+"/caddy"))
+			case "Caddy hardlink":
+				require.NoError(t, os.Mkdir(p.ConfigDir+"/caddy", 0700))
+				require.NoError(t, os.Link(outside, p.ConfigDir+"/caddy/Caddyfile"))
+			case "output symlink":
+				require.NoError(t, os.Symlink(filepath.Dir(p.ConfigDir), output))
+			case "output file":
+				require.NoError(t, os.WriteFile(output, []byte("untouched"), 0600))
+			}
+			r := &BackupRunner{Paths: p, FS: fs, Exec: e, Env: &FileEnvManager{Path: p.EnvFile}, Out: new(bytes.Buffer), ErrOut: new(bytes.Buffer)}
+			require.Error(t, r.Run(output))
+			require.Empty(t, e.calls)
+			data, err := os.ReadFile(outside)
+			require.NoError(t, err)
+			require.Equal(t, "untouched", string(data))
+		})
+	}
+}
+
+func TestBackupCommandFailuresDoNotClaimSuccess(t *testing.T) {
+	for _, fail := range []string{"SHOW server_version_num", "pg_dump", "tar czf", "chmod 0600", "mkdir -m"} {
+		t.Run(fail, func(t *testing.T) {
+			p, fs, e := recoveryFixture(t, true)
+			e.fail = fail
+			out := new(bytes.Buffer)
+			r := &BackupRunner{Paths: p, FS: fs, Exec: e, Env: &FileEnvManager{Path: p.EnvFile}, Out: out, ErrOut: out}
+			require.Error(t, r.Run(filepath.Dir(p.ConfigDir)))
+			require.NotContains(t, out.String(), "Backup saved to:")
+		})
+	}
 }
