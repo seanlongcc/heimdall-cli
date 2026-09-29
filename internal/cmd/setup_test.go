@@ -1587,3 +1587,45 @@ func TestSetupRPMTLSSelection(t *testing.T) {
 		})
 	}
 }
+
+func TestInteractiveRPMResolvedPasswordDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode string
+		saved      map[string]string
+		args       []string
+		want       string
+	}{
+		{"URL-only Enter rerun", "external", map[string]string{"DATABASE_URL": "postgres://app:secret@db.example:6432/prod"}, nil, "secret"},
+		{"external explicit flag", "external", map[string]string{"DATABASE_PASSWORD": "old"}, []string{"--db-password=explicit"}, "explicit"},
+		{"bundled explicit flag", "bundled", map[string]string{"DATABASE_PASSWORD": "old"}, []string{"--db-password=explicit"}, "explicit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _, _ := newTestSetupRunner()
+			r.FS.(*FakeFileSystem).Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+			saved := tc.saved
+			saved["JWT_SECRET"] = "saved-jwt"
+			saved["API_KEY_SECRET"] = "saved-api"
+			saved["HEIMDALL_DATABASE_MODE"] = tc.mode
+			saved["HEIMDALL_PROXY_MODE"] = "external"
+			r.Env.(*FakeEnvManager).Env = saved
+			r.Prompter = &FakePrompter{IsTTY: true}
+			db := &recordingDBConnector{}
+			r.DB = db
+			cmd := NewSetupCmd(r)
+			cmd.SetArgs(append([]string{"--interactive", "--reconfigure"}, tc.args...))
+			require.NoError(t, cmd.Execute())
+			env := r.Env.(*FakeEnvManager).Env
+			require.Equal(t, tc.want, env["DATABASE_PASSWORD"])
+			require.Equal(t, "saved-jwt", env["JWT_SECRET"])
+			require.Equal(t, "saved-api", env["API_KEY_SECRET"])
+			if saved["DATABASE_URL"] != "" {
+				require.Equal(t, saved["DATABASE_URL"], env["DATABASE_URL"])
+				require.Equal(t, "db.example", env["DATABASE_HOST"])
+				require.Equal(t, "6432", env["DATABASE_PORT"])
+				require.Equal(t, "app", env["DATABASE_USERNAME"])
+				require.Equal(t, "prod", env["DATABASE_NAME"])
+			}
+			require.Zero(t, db.connections)
+		})
+	}
+}

@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"crypto/x509"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -126,4 +128,36 @@ func TestResolveDBConfigMatchesApplicationURLLiteralComponents(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "p%40ss", cfg.Password, "application URL parser retains percent escapes")
 	require.Equal(t, "my%2Ddb", cfg.DBName)
+}
+
+func TestResolveDBConfigTLSTrustPolicy(t *testing.T) {
+	for _, tc := range []struct{ name, ca, insecure, mode string }{
+		{"verified system trust", "", "false", "verify-full"},
+		{"verified explicit trust", "/custom/root.pem", "false", "verify-full"},
+		{"insecure ignores explicit trust", "/custom/root.pem", "true", "require"},
+		{"insecure ignores ambient trust", "", "true", "require"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := resolveDBConfig(map[string]string{"DATABASE_SSL": "true", "DATABASE_SSL_INSECURE": tc.insecure, "DATABASE_SSL_CA": tc.ca, "DATABASE_SSL_CERT": "/client.pem", "DATABASE_SSL_KEY": "/key.pem"})
+			require.NoError(t, err)
+			env := cfg.PgEnv()
+			require.Equal(t, tc.mode, env["PGSSLMODE"])
+			require.Equal(t, "/client.pem", env["PGSSLCERT"])
+			require.Equal(t, "/key.pem", env["PGSSLKEY"])
+			root := env["PGSSLROOTCERT"]
+			if tc.insecure == "true" {
+				require.Equal(t, "/dev/null/heimdall-no-root.crt", root)
+				_, err := os.Stat(root)
+				require.Error(t, err)
+			} else if tc.ca != "" {
+				require.Equal(t, tc.ca, root)
+			} else {
+				require.NotEmpty(t, root, "verified TLS needs an explicit trust source")
+				require.NotEqual(t, "system", root, "libpq 13 needs a file path")
+				roots, err := os.ReadFile(root)
+				require.NoError(t, err)
+				require.True(t, x509.NewCertPool().AppendCertsFromPEM(roots), "default trust source must contain CA certificates")
+			}
+		})
+	}
 }

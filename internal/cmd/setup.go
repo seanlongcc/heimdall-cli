@@ -559,7 +559,7 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 		}
 		r.DatabaseMode = "bundled"
 
-		dbPassword, err = r.interactivePassword(def("DATABASE_PASSWORD", ""))
+		dbPassword, err = r.interactivePassword(r.DBPassword)
 		if err != nil {
 			return err
 		}
@@ -578,7 +578,7 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 		if err != nil {
 			return err
 		}
-		dbPassword, err = r.interactivePassword(def("DATABASE_PASSWORD", ""))
+		dbPassword, err = r.interactivePassword(r.DBPassword)
 		if err != nil {
 			return err
 		}

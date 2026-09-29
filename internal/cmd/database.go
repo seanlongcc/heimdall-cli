@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -98,10 +99,25 @@ func resolveDBConfig(env map[string]string) (DBConfig, error) {
 	cfg.SSLMode = "disable"
 	if ssl := env["DATABASE_SSL"]; ssl != "" && !strings.EqualFold(ssl, "false") {
 		cfg.SSLMode = "verify-full"
+		cfg.SSLCA, cfg.SSLCert, cfg.SSLKey = env["DATABASE_SSL_CA"], env["DATABASE_SSL_CERT"], env["DATABASE_SSL_KEY"]
 		if strings.EqualFold(env["DATABASE_SSL_INSECURE"], "true") {
 			cfg.SSLMode = "require"
+			// libpq require verifies when a root file exists. ENOTDIR here disables
+			// that implicit verification on libpq 13–18, including ambient root.crt.
+			cfg.SSLCA = "/dev/null/heimdall-no-root.crt"
+		} else if cfg.SSLCA == "" {
+			// Explicit bundle paths work with both the RPM's libpq 18 and older
+			// standalone clients, which do not support sslrootcert=system.
+			for _, path := range []string{"/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"} {
+				if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+					cfg.SSLCA = path
+					break
+				}
+			}
+			if cfg.SSLCA == "" {
+				return DBConfig{}, fmt.Errorf("verified PostgreSQL TLS requires DATABASE_SSL_CA or an installed system CA bundle")
+			}
 		}
-		cfg.SSLCA, cfg.SSLCert, cfg.SSLKey = env["DATABASE_SSL_CA"], env["DATABASE_SSL_CERT"], env["DATABASE_SSL_KEY"]
 	}
 	return cfg, nil
 }
