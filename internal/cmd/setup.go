@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -661,12 +662,32 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 
 	// --- Application config ---
 	fmt.Fprintln(r.Out)
-	externalURL, err := r.Prompter.Input("External URL", r.ExternalURL)
+	defaultExternalURL := r.ExternalURL
+	if defaultExternalURL == "" {
+		defaultExternalURL = "https://" + def("NGINX_HOST", "localhost")
+	}
+	externalURL, err := r.Prompter.Input(fmt.Sprintf("External URL (default: %s)", defaultExternalURL), defaultExternalURL)
 	if err != nil {
 		return err
 	}
+	if externalURL == "" {
+		externalURL = defaultExternalURL
+	}
 	adminEmail, err := r.Prompter.Input("Admin email", def("ADMIN_EMAIL", "admin@heimdall.local"))
 	if err != nil {
+		return err
+	}
+	jwtDefault := def("JWT_EXPIRE_TIME", "1d")
+	fmt.Fprintln(r.Out, "  Heimdall caps JWT lifetimes at 2 days.")
+	jwtExpire, err := r.Prompter.Input(fmt.Sprintf("JWT expiration (e.g. 1d or 25m; default: %s)", jwtDefault), jwtDefault)
+	if err != nil {
+		return err
+	}
+	jwtExpire = strings.TrimSpace(jwtExpire)
+	if jwtExpire == "" {
+		jwtExpire = jwtDefault
+	}
+	if err := ValidateValue("JWT_EXPIRE_TIME", jwtExpire); err != nil {
 		return err
 	}
 
@@ -701,16 +722,45 @@ func (r *SetupRunner) stepConfigureInteractive(existing map[string]string) error
 	if r.ProxyMode == "bundled" && r.TLSMode == "custom" && (r.TLSCert == "" || r.TLSKey == "") {
 		return fmt.Errorf("custom TLS requires certificate and key paths")
 	}
+	certDays := def("HEIMDALL_TLS_CERT_DAYS", "7")
+	u, err := url.Parse(externalURL)
+	if err != nil {
+		return fmt.Errorf("invalid external URL: %w", err)
+	}
+	localTLS := r.TLSMode == "internal"
+	if !r.bundledRuntime {
+		strategy := determineTLSStrategy(u.Hostname(), r.TLSCert, r.TLSKey)
+		localTLS = strategy == tlsPrivate || strategy == tlsIP
+	}
+	if r.ProxyMode == "bundled" && !r.SkipTLS && u.Scheme == "https" && localTLS {
+		certDays, err = r.Prompter.Input(fmt.Sprintf("Certificate lifetime in days (default: %s)", certDays), certDays)
+		if err != nil {
+			return err
+		}
+		certDays = strings.TrimSpace(certDays)
+		if certDays == "" {
+			certDays = def("HEIMDALL_TLS_CERT_DAYS", "7")
+		}
+		if err := ValidateValue("HEIMDALL_TLS_CERT_DAYS", certDays); err != nil {
+			return err
+		}
+		fmt.Fprintln(r.Out, "  Applies to new certificates; existing certificates are preserved.")
+		if r.bundledRuntime || net.ParseIP(u.Hostname()) == nil {
+			fmt.Fprintln(r.Out, "  Caddy may shorten new certificates to the current CA's remaining validity.")
+		}
+	}
 
 	// Build the prompted values map
 	prompted := map[string]string{
-		"DATABASE_HOST":     dbHost,
-		"DATABASE_PORT":     dbPort,
-		"DATABASE_USERNAME": dbUser,
-		"DATABASE_PASSWORD": dbPassword,
-		"DATABASE_NAME":     dbName,
-		"EXTERNAL_URL":      externalURL,
-		"ADMIN_EMAIL":       adminEmail,
+		"DATABASE_HOST":          dbHost,
+		"DATABASE_PORT":          dbPort,
+		"DATABASE_USERNAME":      dbUser,
+		"DATABASE_PASSWORD":      dbPassword,
+		"DATABASE_NAME":          dbName,
+		"EXTERNAL_URL":           externalURL,
+		"ADMIN_EMAIL":            adminEmail,
+		"JWT_EXPIRE_TIME":        jwtExpire,
+		"HEIMDALL_TLS_CERT_DAYS": certDays,
 	}
 	return r.interactiveWriteConfig(existing, prompted)
 }
@@ -802,7 +852,7 @@ func (r *SetupRunner) interactiveWriteConfig(existing, prompted map[string]strin
 	}
 
 	// Derive NGINX_HOST from external URL
-	nginxHost := dbHost
+	nginxHost := envDefault(existing, "NGINX_HOST", "localhost")
 	if externalURL != "" {
 		h := externalURL
 		for _, prefix := range []string{"https://", "http://"} {
@@ -835,7 +885,10 @@ func (r *SetupRunner) interactiveWriteConfig(existing, prompted map[string]strin
 	fmt.Fprintf(r.Out, "    Admin:    %s\n", prompted["ADMIN_EMAIL"])
 	fmt.Fprintln(r.Out)
 
-	return r.writeConfig(existing, dbHost, dbPort, dbUser, dbPassword, dbName,
+	settings := maps.Clone(existing)
+	settings["JWT_EXPIRE_TIME"] = envDefault(prompted, "JWT_EXPIRE_TIME", envDefault(existing, "JWT_EXPIRE_TIME", "1d"))
+	settings["HEIMDALL_TLS_CERT_DAYS"] = envDefault(prompted, "HEIMDALL_TLS_CERT_DAYS", envDefault(existing, "HEIMDALL_TLS_CERT_DAYS", "7"))
+	return r.writeConfig(settings, dbHost, dbPort, dbUser, dbPassword, dbName,
 		jwtSecret, apiKeySecret, nginxHost, externalURL, adminEmail)
 }
 
@@ -889,7 +942,7 @@ func (r *SetupRunner) writeConfig(existing map[string]string,
 	dbHost, dbPort, dbUser, dbPassword, dbName,
 	jwtSecret, apiKeySecret, nginxHost, externalURL, adminEmail string) error {
 
-	// Preserve values that aren't prompted for
+	// Preserve saved values unless the interactive wizard supplied replacements.
 	port := DefaultAppPort
 	if v, ok := existing["PORT"]; ok && v != "" {
 		port = v
@@ -898,23 +951,31 @@ func (r *SetupRunner) writeConfig(existing map[string]string,
 	if v, ok := existing["JWT_EXPIRE_TIME"]; ok && v != "" {
 		jwtExpire = v
 	}
+	if err := ValidateValue("JWT_EXPIRE_TIME", jwtExpire); err != nil {
+		return err
+	}
+	certDays := envDefault(existing, "HEIMDALL_TLS_CERT_DAYS", "7")
+	if err := ValidateValue("HEIMDALL_TLS_CERT_DAYS", certDays); err != nil {
+		return err
+	}
 	adminPassword := existing["ADMIN_PASSWORD"]
 
 	// Write all keys — matches heimdall-configure.sh output
 	entries := map[string]string{
-		"NODE_ENV":          "production",
-		"PORT":              port,
-		"DATABASE_HOST":     dbHost,
-		"DATABASE_PORT":     dbPort,
-		"DATABASE_USERNAME": dbUser,
-		"DATABASE_PASSWORD": dbPassword,
-		"DATABASE_NAME":     dbName,
-		"JWT_SECRET":        jwtSecret,
-		"JWT_EXPIRE_TIME":   jwtExpire,
-		"API_KEY_SECRET":    apiKeySecret,
-		"NGINX_HOST":        nginxHost,
-		"EXTERNAL_URL":      externalURL,
-		"ADMIN_EMAIL":       adminEmail,
+		"NODE_ENV":               "production",
+		"PORT":                   port,
+		"DATABASE_HOST":          dbHost,
+		"DATABASE_PORT":          dbPort,
+		"DATABASE_USERNAME":      dbUser,
+		"DATABASE_PASSWORD":      dbPassword,
+		"DATABASE_NAME":          dbName,
+		"JWT_SECRET":             jwtSecret,
+		"JWT_EXPIRE_TIME":        jwtExpire,
+		"API_KEY_SECRET":         apiKeySecret,
+		"NGINX_HOST":             nginxHost,
+		"EXTERNAL_URL":           externalURL,
+		"ADMIN_EMAIL":            adminEmail,
+		"HEIMDALL_TLS_CERT_DAYS": certDays,
 	}
 	if adminPassword != "" {
 		entries["ADMIN_PASSWORD"] = adminPassword
@@ -1106,6 +1167,17 @@ func (r *SetupRunner) runTLSCommand(name string, args ...string) error {
 // configureCaddyfile applies the TLS strategy to the Caddyfile and generates
 // certificates when needed.
 func (r *SetupRunner) configureCaddyfile(strategy tlsStrategy, host, caddyfileDst string) error {
+	days := 7
+	if strategy == tlsPrivate || strategy == tlsIP {
+		env, err := r.Env.ReadEnv()
+		if err != nil {
+			return err
+		}
+		days, err = certificateLifetimeDays(env)
+		if err != nil {
+			return err
+		}
+	}
 	if strategy != tlsIP {
 		if err := r.runTLSCommand("sed", "-i", fmt.Sprintf("s|^:443 {|%s {|", host), caddyfileDst); err != nil {
 			return err
@@ -1121,7 +1193,7 @@ func (r *SetupRunner) configureCaddyfile(strategy tlsStrategy, host, caddyfileDs
 		fmt.Fprintf(r.Out, "    Key:  %s\n", r.TLSKey)
 
 	case tlsPrivate:
-		if err := r.runTLSCommand("sed", "-i", `/reverse_proxy/i\\ttls internal`, caddyfileDst); err != nil {
+		if err := r.runTLSCommand("sed", "-i", fmt.Sprintf(`/reverse_proxy/i\\ttls {\n\t\tissuer internal {\n\t\t\tlifetime %dh\n\t\t}\n\t}`, days*24), caddyfileDst); err != nil {
 			return err
 		}
 		fmt.Fprintln(r.Out, "  Caddy: private hostname detected — using internal CA")
@@ -1142,7 +1214,7 @@ func (r *SetupRunner) configureCaddyfile(strategy tlsStrategy, host, caddyfileDs
 		certFile := certDir + "/server.crt"
 		keyFile := certDir + "/server.key"
 		if !r.FS.Exists(certFile) {
-			if err := r.runTLSCommand("openssl", "req", "-x509", "-nodes", "-days", "365",
+			if err := r.runTLSCommand("openssl", "req", "-x509", "-nodes", "-days", strconv.Itoa(days),
 				"-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
 				"-keyout", keyFile, "-out", certFile,
 				"-subj", fmt.Sprintf("/CN=%s", host),
@@ -1574,6 +1646,14 @@ func checkOwnedPort(exec ExecRunner, systemd SystemdRunner, port int, unit strin
 const bundledCaddyService = "heimdall-caddy"
 const bundledCaddyRoot = "/var/lib/heimdall-caddy/data/caddy/pki/authorities/local/root.crt"
 
+func certificateLifetimeDays(env map[string]string) (int, error) {
+	days := envDefault(env, "HEIMDALL_TLS_CERT_DAYS", "7")
+	if err := ValidateValue("HEIMDALL_TLS_CERT_DAYS", days); err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(days)
+}
+
 func renderBundledCaddy(env map[string]string) (string, error) {
 	return renderPrivateCaddy(env, ConfigDir+"/caddy")
 }
@@ -1591,7 +1671,13 @@ func renderPrivateCaddy(env map[string]string, dir string) (string, error) {
 	tlsLine := ""
 	switch env["HEIMDALL_TLS_MODE"] {
 	case "internal":
-		tlsLine = "\ttls internal\n"
+		days, err := certificateLifetimeDays(env)
+		if err != nil {
+			return "", err
+		}
+		// Caddy renews intermediates with 20% remaining; keep that longer than a leaf lifetime.
+		global += fmt.Sprintf("\tpki {\n\t\tca local {\n\t\t\tintermediate_lifetime %dh\n\t\t}\n\t}\n", days*24*6)
+		tlsLine = fmt.Sprintf("\ttls {\n\t\tissuer internal {\n\t\t\tlifetime %dh\n\t\t}\n\t}\n", days*24)
 	case "custom":
 		tlsLine = fmt.Sprintf("\ttls %s %s\n", strconv.Quote(dir+"/certs/server.crt"), strconv.Quote(dir+"/certs/server.key"))
 	case "acme":

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,6 +82,7 @@ func schemaEntries() []ConfigEntry {
 		{Key: "HEIMDALL_TLS_MODE", Category: "proxy", Type: "str", Choices: []string{"acme", "internal", "custom"}, Description: "Bundled proxy TLS mode; change through setup."},
 		{Key: "HEIMDALL_TLS_CERT", Category: "proxy", Type: "path", Description: "Custom TLS certificate path; change through setup."},
 		{Key: "HEIMDALL_TLS_KEY", Category: "proxy", Type: "path", Description: "Custom TLS private key path; change through setup."},
+		{Key: "HEIMDALL_TLS_CERT_DAYS", Category: "proxy", Type: "int", Default: "7", Validation: "1-365", Description: "Requested lifetime in days for new local certificates; change through setup."},
 		// Database
 		{Key: "DATABASE_HOST", Category: "database", Type: "str", Default: "localhost", Description: "PostgreSQL hostname."},
 		{Key: "DATABASE_PORT", Category: "database", Type: "int", Default: "5432", Validation: "1-65535", Description: "PostgreSQL port."},
@@ -187,12 +189,25 @@ func KeysForCategory(catID string) []string {
 	return keys
 }
 
+// Match the backend's ms duration syntax; JWT lifetimes must be positive.
+var jwtDurationPattern = regexp.MustCompile(`(?i)^((?:[0-9]+)?\.?[0-9]+) *(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|years?|yrs?|y)?$`)
+
 // ValidateValue validates a value against the schema entry for key.
 // Returns nil if valid or no schema entry exists, error otherwise.
 func ValidateValue(key, value string) error {
 	entry, ok := ConfigSchema[key]
 	if !ok {
 		return nil // unknown keys pass validation
+	}
+	if key == "JWT_EXPIRE_TIME" {
+		match := jwtDurationPattern.FindStringSubmatch(value)
+		if len(value) > 100 || match == nil {
+			return fmt.Errorf("JWT_EXPIRE_TIME must be a positive duration such as 1d or 25m")
+		}
+		n, err := strconv.ParseFloat(match[1], 64)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("JWT_EXPIRE_TIME must be a positive duration such as 1d or 25m")
+		}
 	}
 
 	switch entry.Type {

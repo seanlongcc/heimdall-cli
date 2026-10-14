@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,18 +179,18 @@ func TestStepTLS_PrivateHostname(t *testing.T) {
 	assert.Contains(t, output, "internal CA")
 	assert.Contains(t, output, "root.crt")
 
-	// Verify tls internal was added via sed
+	// Verify the internal issuer and default lifetime were added via sed.
 	foundTLSInternal := false
 	for _, c := range r.Exec.(*FakeExecRunner).Calls {
 		if c.Name == "sed" {
 			for _, arg := range c.Args {
-				if arg == `/reverse_proxy/i\\ttls internal` {
+				if arg == `/reverse_proxy/i\\ttls {\n\t\tissuer internal {\n\t\t\tlifetime 168h\n\t\t}\n\t}` {
 					foundTLSInternal = true
 				}
 			}
 		}
 	}
-	assert.True(t, foundTLSInternal, "sed should insert tls internal for private hostname")
+	assert.True(t, foundTLSInternal, "sed should configure the internal issuer lifetime for private hostnames")
 }
 
 func TestStepTLS_PublicHostname(t *testing.T) {
@@ -442,8 +443,65 @@ func TestBundledCaddyUsesConfiguredPort(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, config, "127.0.0.1:3210")
 	require.Contains(t, config, "unix//run/heimdall-caddy/admin.sock")
-	require.Contains(t, config, "tls internal")
+	require.Contains(t, config, "issuer internal")
 	require.NotContains(t, config, "127.0.0.1:3000")
+}
+
+func TestLocalCertificateLifetime(t *testing.T) {
+	for _, tc := range []struct {
+		days, hours, intermediateHours string
+	}{
+		{"", "168", "1008"},
+		{"30", "720", "4320"},
+	} {
+		t.Run("bundled_"+tc.days, func(t *testing.T) {
+			config, err := renderBundledCaddy(map[string]string{
+				"EXTERNAL_URL": "https://localhost", "HEIMDALL_TLS_MODE": "internal", "HEIMDALL_TLS_CERT_DAYS": tc.days,
+			})
+			require.NoError(t, err)
+			require.Contains(t, config, "issuer internal {\n\t\t\tlifetime "+tc.hours+"h\n")
+			require.Contains(t, config, "intermediate_lifetime "+tc.intermediateHours+"h")
+			require.NotContains(t, config, "sign_with_root")
+		})
+		t.Run("legacy_private_"+tc.days, func(t *testing.T) {
+			r, _ := newTLSTestRunner(map[string]string{
+				"EXTERNAL_URL": "https://localhost", "HEIMDALL_TLS_CERT_DAYS": tc.days,
+			})
+			require.NoError(t, r.stepTLS())
+			found := false
+			for _, call := range r.Exec.(*FakeExecRunner).Calls {
+				if call.Name == "sed" && strings.Contains(strings.Join(call.Args, " "), "lifetime "+tc.hours+"h") {
+					found = true
+				}
+			}
+			require.True(t, found, "legacy Caddy must receive the requested local certificate lifetime")
+		})
+	}
+	for _, tc := range []struct{ days, want string }{{"", "7"}, {"30", "30"}} {
+		t.Run("legacy_ip_"+tc.days, func(t *testing.T) {
+			r, _ := newTLSTestRunner(map[string]string{
+				"EXTERNAL_URL": "https://192.168.1.100", "HEIMDALL_TLS_CERT_DAYS": tc.days,
+			})
+			require.NoError(t, r.stepTLS())
+			found := false
+			for _, call := range r.Exec.(*FakeExecRunner).Calls {
+				if call.Name == "openssl" {
+					found = true
+					require.Contains(t, strings.Join(call.Args, " "), "-days "+tc.want+" -newkey")
+				}
+			}
+			require.True(t, found)
+		})
+	}
+}
+
+func TestBundledCaddyRejectsInvalidCertificateLifetime(t *testing.T) {
+	for _, days := range []string{"0", "-1", "1.5", "366", "7\n}"} {
+		_, err := renderBundledCaddy(map[string]string{
+			"EXTERNAL_URL": "https://localhost", "HEIMDALL_TLS_MODE": "internal", "HEIMDALL_TLS_CERT_DAYS": days,
+		})
+		require.ErrorContains(t, err, "HEIMDALL_TLS_CERT_DAYS", days)
+	}
 }
 
 func TestBundledCaddyRejectsUnsafeSettings(t *testing.T) {
@@ -550,5 +608,5 @@ func (s *caddyStartFailure) Start(unit string) error {
 func TestBundledCaddyCanonicalWhitespace(t *testing.T) {
 	config, err := renderBundledCaddy(map[string]string{"PORT": "3210", "EXTERNAL_URL": "https://heimdall.example.test", "HEIMDALL_TLS_MODE": "internal"})
 	require.NoError(t, err)
-	require.Equal(t, "{\n\tadmin unix//run/heimdall-caddy/admin.sock\n\tskip_install_trust\n}\n\"https://heimdall.example.test\" {\n\ttls internal\n\treverse_proxy \"127.0.0.1:3210\"\n}\n", config)
+	require.Equal(t, "{\n\tadmin unix//run/heimdall-caddy/admin.sock\n\tskip_install_trust\n\tpki {\n\t\tca local {\n\t\t\tintermediate_lifetime 1008h\n\t\t}\n\t}\n}\n\"https://heimdall.example.test\" {\n\ttls {\n\t\tissuer internal {\n\t\t\tlifetime 168h\n\t\t}\n\t}\n\treverse_proxy \"127.0.0.1:3210\"\n}\n", config)
 }

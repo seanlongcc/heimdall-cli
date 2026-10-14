@@ -594,6 +594,64 @@ func TestResolveExternalHost_FallsBackToLocalhost(t *testing.T) {
 
 // --- Interactive setup tests (topology-aware wizard) ---
 
+func TestInteractiveRPMExternalURLDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		saved             map[string]string
+		args              []string
+		clearInput        bool
+		wantURL, wantHost string
+	}{
+		{"fresh bundled database", nil, nil, false, "https://localhost", "localhost"},
+		{"external database", nil, []string{"--database-mode=external", "--db-host=db.example.com"}, false, "https://localhost", "localhost"},
+		{"saved hostname", map[string]string{"NGINX_HOST": "heimdall.example.com"}, nil, false, "https://heimdall.example.com", "heimdall.example.com"},
+		{"saved URL", map[string]string{"EXTERNAL_URL": "https://saved.example.com", "NGINX_HOST": "old.example.com"}, nil, false, "https://saved.example.com", "saved.example.com"},
+		{"explicit URL", map[string]string{"EXTERNAL_URL": "https://saved.example.com"}, []string{"--external-url=https://flag.example.com"}, false, "https://flag.example.com", "flag.example.com"},
+		{"cleared input keeps displayed default", map[string]string{"EXTERNAL_URL": "https://saved.example.com", "NGINX_HOST": "old.example.com"}, nil, true, "https://saved.example.com", "saved.example.com"},
+		{"no TLS keeps existing fallback convention", nil, []string{"--proxy-mode=none"}, false, "https://localhost", "localhost"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _, _ := newTestSetupRunner()
+			r.FS.(*FakeFileSystem).Files[r.Paths.AppDir+"/runtime-manifest.json"] = []byte(`{}`)
+			r.Env.(*FakeEnvManager).Env = tc.saved
+			prompt := "External URL (default: " + tc.wantURL + ")"
+			prompter := &FakePrompter{IsTTY: true}
+			if tc.clearInput {
+				prompter.Inputs = map[string]string{prompt: ""}
+			}
+			r.Prompter = prompter
+			cmd := NewSetupCmd(r)
+			cmd.SetArgs(append([]string{"--interactive", "--reconfigure"}, tc.args...))
+			require.NoError(t, cmd.Execute())
+			assert.Contains(t, prompter.InputDefaults, prompt)
+			assert.Equal(t, tc.wantURL, prompter.InputDefaults[prompt])
+			env := r.Env.(*FakeEnvManager).Env
+			assert.Equal(t, tc.wantURL, env["EXTERNAL_URL"])
+			assert.Equal(t, tc.wantHost, env["NGINX_HOST"])
+		})
+	}
+}
+
+func TestInteractiveRerunExternalURLFallback(t *testing.T) {
+	for _, tc := range []struct{ hostname, wantURL string }{
+		{"", "https://localhost"},
+		{"heimdall.example.com", "https://heimdall.example.com"},
+	} {
+		t.Run(tc.wantURL, func(t *testing.T) {
+			r, _, _ := newTestSetupRunner()
+			r.Interactive = true
+			r.Env.(*FakeEnvManager).Env = map[string]string{
+				"DATABASE_HOST":     "db.example.com",
+				"DATABASE_PASSWORD": "saved-password",
+				"NGINX_HOST":        tc.hostname,
+			}
+			r.Prompter = &FakePrompter{IsTTY: true}
+			require.NoError(t, r.stepConfigure())
+			assert.Equal(t, tc.wantURL, r.Env.(*FakeEnvManager).Env["EXTERNAL_URL"])
+		})
+	}
+}
+
 // Test: External DB + External SSL (most common enterprise deployment)
 func TestInteractive_ExternalDB_ExternalSSL(t *testing.T) {
 	r, out, _ := newTestSetupRunner()
@@ -610,8 +668,8 @@ func TestInteractive_ExternalDB_ExternalSSL(t *testing.T) {
 			"Database password": "Str0ng!Pass#2026",
 			"Confirm password":  "Str0ng!Pass#2026",
 			"Database name":     "heimdall_prod",
-			"External URL":      "https://heimdall.example.com",
-			"Admin email":       "admin@example.com",
+			"External URL (default: https://localhost)": "https://heimdall.example.com",
+			"Admin email": "admin@example.com",
 		},
 		IsTTY: true,
 	}
@@ -644,10 +702,10 @@ func TestInteractive_LocalDB_Caddy(t *testing.T) {
 			"TLS/SSL setup":  0, // Caddy
 		},
 		Inputs: map[string]string{
-			"Database password": "localpass",
-			"Confirm password":  "localpass",
-			"External URL":      "https://heimdall.local",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "localpass",
+			"Confirm password":                          "localpass",
+			"External URL (default: https://localhost)": "https://heimdall.local",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -673,16 +731,16 @@ func TestInteractive_ExternalDB_BYOCert(t *testing.T) {
 			"TLS/SSL setup":  2, // BYO certificate
 		},
 		Inputs: map[string]string{
-			"Database host":        "db.example.com",
-			"Database port":        "5432",
-			"Database user":        "heimdall",
-			"Database password":    "secret",
-			"Confirm password":     "secret",
-			"Database name":        "heimdall_prod",
-			"TLS certificate path": "/etc/pki/tls/certs/heimdall.crt",
-			"TLS private key path": "/etc/pki/tls/private/heimdall.key",
-			"External URL":         "https://heimdall.example.com",
-			"Admin email":          "admin@example.com",
+			"Database host":                             "db.example.com",
+			"Database port":                             "5432",
+			"Database user":                             "heimdall",
+			"Database password":                         "secret",
+			"Confirm password":                          "secret",
+			"Database name":                             "heimdall_prod",
+			"TLS certificate path":                      "/etc/pki/tls/certs/heimdall.crt",
+			"TLS private key path":                      "/etc/pki/tls/private/heimdall.key",
+			"External URL (default: https://localhost)": "https://heimdall.example.com",
+			"Admin email":                               "admin@example.com",
 		},
 		IsTTY: true,
 	}
@@ -705,10 +763,10 @@ func TestInteractive_LocalDB_NoTLS(t *testing.T) {
 			"TLS/SSL setup":  3, // No TLS
 		},
 		Inputs: map[string]string{
-			"Database password": "devpass",
-			"Confirm password":  "devpass",
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "devpass",
+			"Confirm password":                          "devpass",
+			"External URL (default: https://localhost)": "",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -783,8 +841,8 @@ func TestInteractive_RerunEditConfig(t *testing.T) {
 			"Database user":     "postgres",             // kept
 			"Database password": "",                     // blank keeps the existing password
 			"Database name":     "olddb",                // kept
-			"External URL":      "https://old.example.com",
-			"Admin email":       "old@example.com",
+			"External URL (default: https://old.example.com)": "https://old.example.com",
+			"Admin email": "old@example.com",
 		},
 		IsTTY: true,
 	}
@@ -834,9 +892,9 @@ func TestInteractive_EmptyPasswordAutoGenerates(t *testing.T) {
 			"TLS/SSL setup":  3, // No TLS
 		},
 		Inputs: map[string]string{
-			"Database password": "", // empty = auto-generate
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "", // empty = auto-generate
+			"External URL (default: https://localhost)": "",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -863,10 +921,10 @@ func TestInteractive_ExistingSecretsPreserved(t *testing.T) {
 			"TLS/SSL setup":  0, // Caddy
 		},
 		Inputs: map[string]string{
-			"Database password": "pass",
-			"Confirm password":  "pass",
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "pass",
+			"Confirm password":                          "pass",
+			"External URL (default: https://localhost)": "",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -890,10 +948,10 @@ func TestInteractive_SecretsAutoGenerated(t *testing.T) {
 			"TLS/SSL setup":  0, // Caddy
 		},
 		Inputs: map[string]string{
-			"Database password": "pass",
-			"Confirm password":  "pass",
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "pass",
+			"Confirm password":                          "pass",
+			"External URL (default: https://localhost)": "",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -918,10 +976,10 @@ func TestInteractive_DeriveExternalURL(t *testing.T) {
 			"TLS/SSL setup":  0, // Caddy
 		},
 		Inputs: map[string]string{
-			"Database password": "pass",
-			"Confirm password":  "pass",
-			"External URL":      "https://heimdall.example.com:443/app",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "pass",
+			"Confirm password":                          "pass",
+			"External URL (default: https://localhost)": "https://heimdall.example.com:443/app",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -944,10 +1002,10 @@ func TestInteractive_URLDerivesNginxHostFromHTTP(t *testing.T) {
 			"TLS/SSL setup":  0,
 		},
 		Inputs: map[string]string{
-			"Database password": "pass",
-			"Confirm password":  "pass",
-			"External URL":      "http://heimdall.internal:8080/path",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "pass",
+			"Confirm password":                          "pass",
+			"External URL (default: https://localhost)": "http://heimdall.internal:8080/path",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -959,8 +1017,8 @@ func TestInteractive_URLDerivesNginxHostFromHTTP(t *testing.T) {
 	assert.Equal(t, "heimdall.internal", env["NGINX_HOST"], "NGINX_HOST derived from http:// URL")
 }
 
-// Test: Empty URL derives from localhost for local DB
-func TestInteractive_EmptyURLDerivesFromHost(t *testing.T) {
+// Test: Empty URL uses the displayed localhost default
+func TestInteractive_EmptyURLUsesDefault(t *testing.T) {
 	r, _, _ := newTestSetupRunner()
 	r.Interactive = true
 	r.Prompter = &FakePrompter{
@@ -969,10 +1027,10 @@ func TestInteractive_EmptyURLDerivesFromHost(t *testing.T) {
 			"TLS/SSL setup":  0, // Caddy
 		},
 		Inputs: map[string]string{
-			"Database password": "pass",
-			"Confirm password":  "pass",
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "pass",
+			"Confirm password":                          "pass",
+			"External URL (default: https://localhost)": "",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -981,8 +1039,7 @@ func TestInteractive_EmptyURLDerivesFromHost(t *testing.T) {
 	require.NoError(t, err)
 
 	env := r.Env.(*FakeEnvManager).Env
-	// When external URL is empty, nginxHost comes from dbHost (localhost),
-	// and externalURL = "https://" + nginxHost
+	// Empty input accepts the displayed public URL default.
 	assert.Equal(t, "https://localhost", env["EXTERNAL_URL"])
 	assert.Equal(t, "localhost", env["NGINX_HOST"])
 }
@@ -997,10 +1054,10 @@ func TestSetupCmd_InteractiveFlagWorks(t *testing.T) {
 			"TLS/SSL setup":  3, // No TLS (avoids TLS step)
 		},
 		Inputs: map[string]string{
-			"Database password": "testpass",
-			"Confirm password":  "testpass",
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "testpass",
+			"Confirm password":                          "testpass",
+			"External URL (default: https://localhost)": "",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -1030,10 +1087,10 @@ func TestInteractive_StartFresh(t *testing.T) {
 			"TLS/SSL setup":              3, // No TLS
 		},
 		Inputs: map[string]string{
-			"Database password": "fresh-pass",
-			"Confirm password":  "fresh-pass",
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "fresh-pass",
+			"Confirm password":                          "fresh-pass",
+			"External URL (default: https://localhost)": "",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -1237,8 +1294,8 @@ func TestInteractive_ExternalDB_ConnectivityTestPasses(t *testing.T) {
 			"Database password": "pass123",
 			"Confirm password":  "pass123",
 			"Database name":     "heimdall",
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"External URL (default: https://localhost)": "",
+			"Admin email": "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -1265,8 +1322,8 @@ func TestInteractive_ExternalDB_ConnectivityTestFails(t *testing.T) {
 			"Database password": "pass123",
 			"Confirm password":  "pass123",
 			"Database name":     "heimdall",
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"External URL (default: https://localhost)": "",
+			"Admin email": "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}
@@ -1309,10 +1366,10 @@ func TestInteractive_LocalDB_SkipsConnectivityTest(t *testing.T) {
 			"TLS/SSL setup":  3, // No TLS
 		},
 		Inputs: map[string]string{
-			"Database password": "pass",
-			"Confirm password":  "pass",
-			"External URL":      "",
-			"Admin email":       "admin@heimdall.local",
+			"Database password":                         "pass",
+			"Confirm password":                          "pass",
+			"External URL (default: https://localhost)": "",
+			"Admin email":                               "admin@heimdall.local",
 		},
 		IsTTY: true,
 	}

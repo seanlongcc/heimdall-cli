@@ -180,6 +180,8 @@ func (r *ConfigRunner) Get(key string) error {
 // Set updates a config key after validation.
 func (r *ConfigRunner) Set(key, value string) error {
 	switch key {
+	case "HEIMDALL_TLS_CERT_DAYS":
+		return fmt.Errorf("Use heimdall-cli setup --interactive to change certificate lifetime.")
 	case "HEIMDALL_DATABASE_MODE", "HEIMDALL_PROXY_MODE", "HEIMDALL_TLS_MODE", "HEIMDALL_TLS_CERT", "HEIMDALL_TLS_KEY":
 		return fmt.Errorf("Use heimdall-cli setup --database-mode or --proxy-mode to change service ownership.")
 	}

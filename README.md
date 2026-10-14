@@ -47,6 +47,22 @@ uses `--tls-cert` and `--tls-key`. External PostgreSQL majors **13–18** are
 supported, using the private version-18 clients. Newer servers require a newer
 compatible RPM/client; setup and backup refuse them.
 
+Interactive setup displays each public URL, JWT expiration, and local certificate
+lifetime default. The public URL uses the supplied or saved `EXTERNAL_URL`, then
+`https://` plus saved `NGINX_HOST`, and finally `https://localhost`. Enter accepts
+the displayed value. JWT expiration (`JWT_EXPIRE_TIME`) defaults to `1d` and
+accepts durations such as `25m`; Heimdall caps the effective lifetime at two days.
+
+For locally issued HTTPS certificates, setup asks for the requested lifetime in
+whole days (1–365, default `7`) and saves `HEIMDALL_TLS_CERT_DAYS`. ACME, supplied
+certificates, external proxies, HTTP, and `--skip-tls` omit this question. Existing
+certificates and CA state are preserved; changes apply to new issuance. Bundled
+Caddy configures its intermediate CA lifetime to allow the requested leaf lifetime
+during normal renewal. An existing intermediate CA can temporarily shorten newly
+issued certificates until it renews. Standalone Caddy keeps its administrator's
+CA configuration, which may likewise limit the requested lifetime. Use interactive
+setup again to change the saved lifetime; non-interactive reruns preserve it.
+
 ```sh
 sudo heimdall-cli setup --non-interactive \
   --database-mode external --proxy-mode bundled --tls-mode internal \
