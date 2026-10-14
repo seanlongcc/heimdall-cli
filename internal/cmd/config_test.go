@@ -252,7 +252,7 @@ func TestConfigGet_KeyNotInEnv_ButInSchema(t *testing.T) {
 }
 
 func TestConfigSetRejectsDeploymentChanges(t *testing.T) {
-	for _, key := range []string{"HEIMDALL_DATABASE_MODE", "HEIMDALL_PROXY_MODE", "HEIMDALL_TLS_MODE", "HEIMDALL_TLS_CERT", "HEIMDALL_TLS_KEY"} {
+	for _, key := range []string{"HEIMDALL_DATABASE_MODE", "HEIMDALL_PROXY_MODE", "HEIMDALL_TLS_MODE", "HEIMDALL_TLS_CERT", "HEIMDALL_TLS_KEY", "HEIMDALL_TLS_CERT_DAYS"} {
 		env := &FakeEnvManager{Env: map[string]string{key: "keep"}}
 		r := &ConfigRunner{Env: env, Out: new(bytes.Buffer), ErrOut: new(bytes.Buffer)}
 		err := r.Set(key, "external")

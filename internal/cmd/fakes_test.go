@@ -352,17 +352,22 @@ func (f *FakeFileSystem) FindFiles(root, namePattern string) ([]string, error) {
 // If a prompt has no preset answer, the default value is returned.
 // Set Err to simulate prompt errors (e.g., user cancel via Ctrl+C).
 type FakePrompter struct {
-	Inputs   map[string]string // prompt text → answer
-	Confirms map[string]bool   // prompt text → answer
-	Selects  map[string]int    // prompt text → selected index
-	IsTTY    bool
-	Err      error // returned by all methods when non-nil
+	Inputs        map[string]string // prompt text → answer
+	InputDefaults map[string]string // prompt text → displayed default
+	Confirms      map[string]bool   // prompt text → answer
+	Selects       map[string]int    // prompt text → selected index
+	IsTTY         bool
+	Err           error // returned by all methods when non-nil
 }
 
 func (f *FakePrompter) Input(prompt string, defaultValue string) (string, error) {
 	if f.Err != nil {
 		return "", f.Err
 	}
+	if f.InputDefaults == nil {
+		f.InputDefaults = make(map[string]string)
+	}
+	f.InputDefaults[prompt] = defaultValue
 	if v, ok := f.Inputs[prompt]; ok {
 		return v, nil
 	}

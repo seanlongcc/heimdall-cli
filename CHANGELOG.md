@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Interactive setup prompts for JWT expiration and local certificate lifetime,
+  with defaults of one day and seven days respectively.
 - Extracted to its own repository from `mitre/saf-packaging`. The `go.mod`
   module path (`github.com/mitre/heimdall-cli`) now matches the repository
   URL, so `go install` and module vendoring work.
@@ -15,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`.
 
 ### Changed
+- Interactive setup displays the external URL default and uses
+  `https://localhost` when no address has been configured.
 - Contributing and security guidance rewritten for Go; the inherited templates
   described a Ruby on Rails project.
 
